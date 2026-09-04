@@ -6,13 +6,11 @@ BEGIN {
 # tes3cmd: command line tool to do various hacks with TES3 plugins
 # Copyright 2016 by John Moonsugar
 # Distributed as part of the tes3cmd project:
-#   https://github.com/john-moonsugar/tes3cmd/
+#   https://github.com/danneu/tes3cmd/
 # under the MIT License:
-#   https://github.com/john-moonsugar/tes3cmd/blob/master/LICENSE
+#   https://github.com/danneu/tes3cmd/blob/master/LICENSE
 # Documentation:
-#   https://github.com/john-moonsugar/tes3cmd/blob/master/README.md
-# to build on Windows with Par::Packer
-# pp -o tes3cmd.exe tes3cmd
+#   https://github.com/danneu/tes3cmd/blob/master/README.md
 
 BEGIN {
     use constant DBG => grep(/^(?:-d|-?-debug)$/, @ARGV);

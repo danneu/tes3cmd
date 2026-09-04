@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest
+          - macos-26
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+
+      - name: Test and build
+        run: nix flake check --print-build-logs
+
+      - name: Evaluate every supported platform
+        run: nix flake check --all-systems --no-build
+
+  release-notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+
+      - name: git-cliff smoke test
+        run: |
+          out=$(nix run nixpkgs#git-cliff -- \
+            v0.40-pre-release-2..HEAD --strip all)
+          echo "$out"
+
+          echo "$out" | grep -qF '### Features' \
+            || { echo "missing Features section"; exit 1; }
+          echo "$out" | grep -qF '### Bug Fixes' \
+            || { echo "missing Bug Fixes section"; exit 1; }
+          echo "$out" | grep -qF 'Package tes3cmd for macOS and Linux' \
+            || { echo "missing Nix feature entry"; exit 1; }
+          echo "$out" | grep -qF 'Preserve unchanged subrecord bytes' \
+            || { echo "missing codec fix entry"; exit 1; }
+          if echo "$out" | grep -qF 'New options: --active'; then
+            echo "commit before the release-note baseline leaked"
+            exit 1
+          fi

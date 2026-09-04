@@ -1,5 +1,5 @@
 {
-  description = "Development and test environment for tes3cmd";
+  description = "Command-line tool for examining and modifying TES3 plugins";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -22,6 +22,10 @@
             Test2Suite
           ]
         );
+      testPackages = pkgs: [
+        (testPerl pkgs)
+        pkgs.git
+      ];
       packageFor =
         pkgs:
         pkgs.stdenvNoCC.mkDerivation {
@@ -40,7 +44,7 @@
 
           meta = {
             description = "Command-line tool for examining and modifying TES3 plugins";
-            homepage = "https://github.com/john-moonsugar/tes3cmd";
+            homepage = "https://github.com/danneu/tes3cmd";
             license = pkgs.lib.licenses.mit;
             mainProgram = "tes3cmd";
             platforms = systems;
@@ -69,7 +73,7 @@
         in
         {
           default = pkgs.mkShell {
-            packages = [ (testPerl pkgs) ];
+            packages = testPackages pkgs;
           };
         }
       );
@@ -92,7 +96,7 @@
           tests =
             pkgs.runCommand "tes3cmd-tests"
               {
-                nativeBuildInputs = [ (testPerl pkgs) ];
+                nativeBuildInputs = testPackages pkgs;
                 src = self;
               }
               ''

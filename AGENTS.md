@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 tes3cmd is a command line tool for examining and modifying plugins (.esp/.esm) for
 Morrowind (TES3). The entire program is one Perl script, `tes3cmd` (~9500 lines).
-There is no build system or module layout. The behavioral test suite lives in `t/`;
-`Docs/Notes.txt` is the author's historical TODO list and `ChangeLog` summarizes
-releases.
+There is no module layout. The behavioral test suite lives in `t/`, and the Nix
+flake supplies its dependencies. `Docs/Notes.txt` is the author's historical TODO
+list. GitHub release notes are generated from Conventional Commits by git-cliff.
 
 ## Commands
 
@@ -20,7 +20,7 @@ perl tes3cmd help                    # list commands; `help <command>` for one
 perl tes3cmd dump --debug foo.esp    # --debug/-d, --verbose/-v, --assert are global
 perl tes3cmd -testcodec foo.esp      # decode+re-encode every record, report mismatches
 perl tes3cmd -shell                  # Perl REPL with TES3 packages loaded
-pp -o tes3cmd.exe tes3cmd            # Windows build with Par::Packer
+just release minor                   # commit, tag, push, and watch a stable release
 ```
 
 The automated suite uses generated plugin fixtures for CLI, codec, parsing, output,
@@ -113,7 +113,8 @@ directory with no Morrowind install present (the "functionality reduced" path).
 
 - Use Conventional Commits for all commit messages going forward.
 - Tabs for indentation (existing file uses hard tabs at 8 columns).
-- Bump `$::VERSION` in the top `BEGIN` block and add a `ChangeLog` entry for releases.
+- Stable releases use `just release patch|minor|major`, which synchronizes the
+  script and Nix package versions before creating a `vX.Y.Z` tag.
 - Record and subrecord type names are always 4 uppercase chars (`NPC_`, not `NPC`);
   user input is uppercased and `NPC` is special-cased as shorthand.
 - Field names in `@RECDEFS` are user-facing (they appear in `dump --format` and in

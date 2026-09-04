@@ -1,0 +1,39 @@
+# git-cliff config for tes3cmd GitHub release notes.
+
+[changelog]
+header = ""
+body = """
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim }}
+
+{% for commit in commits -%}
+- {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
+{{ commit.message | split(pat="\n") | first | upper_first }}
+{% endfor %}
+{% endfor %}
+"""
+trim = true
+footer = ""
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+filter_commits = false
+tag_pattern = "^v[0-9]+\\.[0-9]+(?:\\.[0-9]+|-pre-release-[0-9]+)$"
+topo_order = false
+sort_commits = "oldest"
+
+# The numeric prefixes preserve this display order and are stripped on output.
+commit_parsers = [
+    { message = "^release v[0-9]+\\.[0-9]+\\.[0-9]+", skip = true },
+    { message = "^feat(\\([^)]+\\))?!?:",     group = "<!-- 0 -->Features" },
+    { message = "^fix(\\([^)]+\\))?!?:",      group = "<!-- 1 -->Bug Fixes" },
+    { message = "^perf(\\([^)]+\\))?!?:",     group = "<!-- 2 -->Performance" },
+    { message = "^docs(\\([^)]+\\))?!?:",     group = "<!-- 3 -->Documentation" },
+    { message = "^refactor(\\([^)]+\\))?!?:", group = "<!-- 4 -->Refactor" },
+    { message = "^build(\\([^)]+\\))?!?:",    group = "<!-- 5 -->Build" },
+    { message = "^ci(\\([^)]+\\))?!?:",       group = "<!-- 6 -->CI" },
+    { message = "^test(\\([^)]+\\))?!?:",     group = "<!-- 7 -->Tests" },
+    { message = "^chore(\\([^)]+\\))?!?:",    group = "<!-- 8 -->Chore" },
+    { message = ".*",                          group = "<!-- 9 -->Other" },
+]

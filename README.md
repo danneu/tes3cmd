@@ -8,9 +8,8 @@ All credit for tes3cmd goes to
 I have just polished it by improving its tests, safety, behavior, and
 documentation.
 
-This repository currently contains a pre-release version. Keep independent
-backups of important plugins and save games, especially when using modifying
-commands.
+Keep independent backups of important plugins and save games, especially when
+using modifying commands.
 
 ## Installation
 
@@ -26,23 +25,34 @@ perl tes3cmd --version
 ```
 
 The repository's Nix flake can build, run, or install tes3cmd with its Perl
-runtime on supported macOS and Linux systems:
+runtime on aarch64 macOS and aarch64 or x86_64 Linux:
 
 ```sh
-nix run . -- --version
-nix build
-nix profile install .
+nix run github:danneu/tes3cmd -- --version
+nix profile install github:danneu/tes3cmd
 ```
 
 The runtime uses modules distributed with Perl, including `Getopt::Long`,
-`Storable`, `File::Temp`, and `IO::Handle`. The project does not yet declare a
-minimum supported Perl version or a formal operating-system support matrix.
+`Storable`, `File::Temp`, and `IO::Handle`. Windows builds are not supported.
 
-To build a standalone Windows executable, install PAR::Packer and run:
+To use a local checkout instead, replace `github:danneu/tes3cmd` with `.`.
+
+## Releasing
+
+Stable releases use `vX.Y.Z` tags. From a clean checkout on `master`, with Nix
+and the GitHub CLI installed and authenticated, run:
 
 ```sh
-pp -o tes3cmd.exe tes3cmd
+just release patch
+just release minor
+just release major
 ```
+
+The recipe pulls with rebase, shows and confirms the next version, updates the
+Perl and Nix package versions, runs the full test gate, commits and tags the
+release, pushes it, and follows the GitHub release workflow. For this
+repository's first stable release, `just release minor` produces `v0.40.0`.
+GitHub release notes are generated from Conventional Commits by git-cliff.
 
 ## Getting help
 
