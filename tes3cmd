@@ -6414,6 +6414,10 @@ This is not for fixing what is commonly referred to as "savegame corruption",
 which is almost always not actual corruption but bad data.
 
 In any case, you will get detailed output on what tes3cmd finds damaged.
+Scanned record boundaries are accepted only after their complete record and
+subrecord structure has been validated. The original file is left untouched
+unless recovery produces a valid plugin with a TES3 header and at least one
+record beyond it.
 
 EXAMPLE(S):
 
@@ -9503,22 +9507,79 @@ sub cmd_dump {
     process_plugin_for_input($plugin, $fun) or return(0);
 } # cmd_dump
 
+sub validate_recovery_record {
+    my($tr) = @_;
+    my $rectype = $tr->rectype;
+    abort("Error, Invalid record type: $rectype")
+	unless ($TES3::Record::RECTYPES{$rectype});
+    my $id = $tr->decode()->id;
+    foreach my $subtype (map {$_->subtype} $tr->subrecs()) {
+	die qq{Error, Invalid record subtype: "$rectype.$subtype"\n}
+	    unless ($TES3::Record::RECTYPES{$rectype}->{$subtype});
+    }
+    return($id);
+}
+
+sub find_recovery_record {
+    my($inp, $plugin, $start_offset, $inp_len) = @_;
+    my $buff_size = 4096;
+    my $overlap = $RECTYPE_LEN - 1;
+    my $scan_offset = $start_offset;
+
+    while ($scan_offset <= $inp_len - $hdr_size) {
+	seek($inp, $scan_offset, SEEK_SET)
+	    or abort(qq{seeking "$plugin" to byte $scan_offset ($!)});
+	my $remaining = $inp_len - $scan_offset;
+	my $read_size = $buff_size + $overlap;
+	$read_size = $remaining if ($read_size > $remaining);
+	my $buff = '';
+	my $n_read = read($inp, $buff, $read_size);
+	abort(qq{reading "$plugin" while scanning from byte $scan_offset ($!)})
+	    unless defined($n_read);
+	return unless ($n_read >= $RECTYPE_LEN);
+
+	for (my $i = 0; $i <= $n_read - $RECTYPE_LEN; $i++) {
+	    my $rectype = substr($buff, $i, $RECTYPE_LEN);
+	    next unless ($rectype ne 'TES3' and $TES3::Record::RECTYPES{$rectype});
+	    my $candidate_offset = $scan_offset + $i;
+	    next if ($candidate_offset > $inp_len - $hdr_size);
+
+	    my $valid = eval {
+		seek($inp, $candidate_offset, SEEK_SET)
+		    or abort(qq{seeking "$plugin" to byte $candidate_offset ($!)});
+		my $tr = TES3::Record->new_from_input($inp, undef, $plugin);
+		abort(qq{missing recovery record at byte $candidate_offset}) unless defined($tr);
+		validate_recovery_record($tr);
+		1;
+	    };
+	    if ($valid) {
+		seek($inp, $candidate_offset, SEEK_SET)
+		    or abort(qq{seeking "$plugin" to byte $candidate_offset ($!)});
+		return($candidate_offset, $rectype);
+	    }
+	    dbg($@) if (DBG and $@);
+	}
+
+	last if ($n_read < $read_size);
+	my $advance = $n_read - $overlap;
+	last unless ($advance > 0);
+	$scan_offset += $advance;
+    }
+    return;
+}
+
 sub cmd_recover {
     my($plugin) = @_;
     dbg("cmd_recover($plugin)") if (DBG);
     my($inp, $out, $plugtmp);
     my $ok = eval {
     ($inp, $out, $plugtmp) = make_temp($plugin);
-    my $typlen = $RECTYPE_LEN - 1;
-    my $buff;
-    my $buff_size = 4096;
     my $expected = "TES3";
     my $inp_len = -s $plugin;
     my $inp_offset = 0;
-    my $rectypes = join('|', keys %TES3::Record::RECTYPES);
     print qq{$plugin: length = $inp_len\n};
     my @removed;
-    my $recovered = 0;
+    my $recovered_records = 0;
     no warnings;
   READREC:
     while ($inp_offset < $inp_len) {
@@ -9526,51 +9587,40 @@ sub cmd_recover {
 	eval {
 	    $tr = TES3::Record->new_from_input($inp, $expected, $plugin);
 	    last READREC unless (defined $tr);
-	    my $rectype = $tr->rectype;
+	    $rectype = $tr->rectype;
+	    my $id = validate_recovery_record($tr);
 	    $expected = undef;
-	    abort("Error, Invalid record type: $rectype") unless ($TES3::Record::RECTYPES{$rectype});
-	    my $id = $tr->decode()->id;
-	    foreach my $subtype (map {$_->subtype} $tr->subrecs()) {
-		die qq{Error, Invalid record subtype: "$rectype.$subtype"\n} unless ($TES3::Record::RECTYPES{$rectype}->{$subtype});
-	    }
 	    printf("Offset: %8d  Found: %s %s\n", $inp_offset, $rectype, $id) if (DBG);
-	    $recovered++;
 	};
 	if ($@) {
 	    dbg($@) if (DBG);
-	    # start a scan from last input offset for something that looks like a record header
+	    last READREC if (defined $expected);
+	    # Scan forward for the next complete, structurally valid record.
 	    my $start_offset = $inp_offset;
 	    print qq{READ ERROR on record starting at: $start_offset\n};
-	    seek($inp, $inp_offset + 1, SEEK_SET) and
-		$inp_offset = tell($inp);;
-	    print qq{Scanning for records from: $inp_offset\n};
-	    my $lost_data;
-	    while (1) {
-		my $n_read = read($inp, $buff, $buff_size + $typlen);
-		last READREC if ($n_read == 0); # EOF
-		if (my($stuff, $rectype) = split(/($rectypes)/, $buff)) {
-		    my $new_offset = $inp_offset + length($stuff);
-		    $lost_data += $stuff;
-		    print qq{Scan found $rectype at: $new_offset\n};
-		    seek($inp, $new_offset, SEEK_SET) and
-			$inp_offset = tell($inp);
-		    push(@removed, [$start_offset, $new_offset]);
-		    last;
-		} else {
-		    # Just in case record header started at end boundary, back up by len of rec ID
-		    if ($n_read == ($buff_size + $typlen)) {
-			seek($inp,  0 - $typlen, SEEK_SET) and
-			    $inp_offset = tell($inp);
-		    }
-		}
+	    my $scan_offset = $inp_offset + 1;
+	    print qq{Scanning for records from: $scan_offset\n};
+	    my($new_offset, $found_type) = find_recovery_record(
+		$inp,
+		$plugin,
+		$scan_offset,
+		$inp_len,
+	    );
+	    unless (defined($new_offset)) {
+		push(@removed, [$start_offset, $inp_len]) if ($start_offset < $inp_len);
+		last READREC;
 	    }
+	    print qq{Scan found $found_type at: $new_offset\n};
+	    $inp_offset = $new_offset;
+	    push(@removed, [$start_offset, $new_offset]);
 	} else {
 	    # everything was AOK
 	    $tr->write_rec($out);
+	    $recovered_records++ if ($rectype ne 'TES3');
 	    $inp_offset = tell($inp); # set inp_offset to current position
 	}
     }
-    if ($recovered and @removed) { # some good data preserved, some bad data discarded
+    if ($recovered_records and @removed) { # some good data preserved, some bad data discarded
 	my $n = scalar(@removed);
 	print "Removed $n section@{[($n > 1) ? 's' : '']} of bad data:\n";
 	my $total = 0;
