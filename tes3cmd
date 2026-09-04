@@ -4156,6 +4156,7 @@ TES3::Record::generate_classes();
 
 use constant {
     CACHE_SCHEMA_VERSION => 1,
+    MASTER_CACHE_SCHEMA_VERSION => 2,
     MIN_TES3_PLUGIN_SIZE => 324,
 };
 
@@ -7409,7 +7410,7 @@ sub load_master_cache {
 	    unless (ref($cache) eq 'HASH' and
 		defined($cache->{schema_version}) and
 		$cache->{schema_version} =~ /^\d+$/ and
-		$cache->{schema_version} == CACHE_SCHEMA_VERSION);
+		$cache->{schema_version} == MASTER_CACHE_SCHEMA_VERSION);
 	die("Master cache codec mismatch for: $esm")
 	    unless (defined($cache->{codec_version}) and
 		$cache->{codec_version} eq $TES3::Record::CODEC_VERSION);
@@ -7443,9 +7444,16 @@ sub save_master_cache {
     store({
 	codec_version => $TES3::Record::CODEC_VERSION,
 	records => $MASTER_ID->{$esm},
-	schema_version => CACHE_SCHEMA_VERSION,
+	schema_version => MASTER_CACHE_SCHEMA_VERSION,
 	source => $source,
     }, master_cache_path($esm));
+}
+
+sub master_lookup_id {
+    my($rectype, $id, $dialogue) = @_;
+    return(lc($id)) unless ($rectype eq 'INFO');
+    return(undef) unless (defined($dialogue));
+    return(lc($dialogue) . "\000" . lc($id));
 }
 
 # load all the records from a master .esm into a dictionary.
@@ -7468,14 +7476,23 @@ sub load_master {
     my $inp = open_for_input($master_file);
     my $ok = eval {
 	my $expected = 'TES3';
+	my $current_dialogue;
 	while (my($rectype, $id, $srh, $recbuf, $hdrflags) = read_quick_parse($inp, $expected, $esm)) {
 	    $expected = undef;
 	    last if (not defined $rectype);
+	    if ($rectype eq 'DIAL') {
+		my $data = $srh->{DATA}->[0];
+		$current_dialogue = (defined($data) and length($data))
+		    ? "$DIAL_TYPE{unpack('C', $data)}:$id"
+		    : undef;
+	    }
 	    next if ($hdrflags & $HDR_FLAGS{ignored});
 	    next if (defined $types and not $types->{$rectype});
+	    my $master_id = master_lookup_id($rectype, $id, $current_dialogue);
+	    next unless (defined($master_id));
 	    #dbg("rec_type = $rectype") if (DBG);
 	    abort("undefined recbuf") unless defined $recbuf;
-	    $MASTER_ID->{$esm}->{$id}->{$rectype} = [$recbuf, $hdrflags];
+	    $MASTER_ID->{$esm}->{$master_id}->{$rectype} = [$recbuf, $hdrflags];
 	}
 	1;
     };
@@ -9512,6 +9529,7 @@ sub cmd_esm {
 sub cmd_clean {
     my($plugin) = @_;
     dbg("cmd_clean($plugin)") if (DBG);
+    $CURRENT_DIAL = undef;
     if ($plugin =~ /\.ess$/) {
 	prn("tes3cmd clean skipping $plugin: don't know how to clean savegames ... yet.");
 	return;
@@ -9730,17 +9748,20 @@ sub cmd_clean {
 	}
 	if ($opt_clean_dups) {
 	    my $id = $plug_tr->decode()->id;
-	    foreach my $master (keys %{my_master}) {
-		next unless (defined $MASTER_ID->{$master}->{$id}->{$rectype});
-		my $mastref = $MASTER_ID->{$master}->{$id}->{$rectype};
-		if (defined($mastref) and my($mast_recbuf, $mast_hdrflags) = @{$mastref}) {
-		    if ($duptype{$rectype} and defined($plug_tr->recbuf()) and
-			($plug_tr->recbuf() eq $mast_recbuf) and
-			($plug_tr->hdrflags eq $mast_hdrflags)) {
-			my $what = "duplicate record";
-			$stats{$what}++;
-			print " Cleaned $what ($rectype): $id\n";
-			return;
+	    my $master_id = master_lookup_id($rectype, $id, $CURRENT_DIAL);
+	    if (defined($master_id)) {
+		foreach my $master (keys %{my_master}) {
+		    next unless (defined $MASTER_ID->{$master}->{$master_id}->{$rectype});
+		    my $mastref = $MASTER_ID->{$master}->{$master_id}->{$rectype};
+		    if (defined($mastref) and my($mast_recbuf, $mast_hdrflags) = @{$mastref}) {
+			if ($duptype{$rectype} and defined($plug_tr->recbuf()) and
+			    ($plug_tr->recbuf() eq $mast_recbuf) and
+			    ($plug_tr->hdrflags eq $mast_hdrflags)) {
+			    my $what = "duplicate record";
+			    $stats{$what}++;
+			    print " Cleaned $what ($rectype): $id\n";
+			    return;
+			}
 		    }
 		}
 	    }

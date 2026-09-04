@@ -59,6 +59,47 @@ sub plugin_bytes {
 	return record('TES3', 0, @header_subrecords) . $gmst;
 }
 
+sub dialogue_plugin_bytes {
+	my (%options) = @_;
+	my @header_subrecords = subrecord(
+		'HEDR',
+		pack(
+			'f<VZ32Z256V',
+			1.3,
+			$options{is_master} || 0,
+			'tes3cmd tests',
+			'dialogue cache fixture',
+			scalar(@{$options{dialogues}}) * 2,
+		),
+	);
+	if (defined($options{master})) {
+		push(
+			@header_subrecords,
+			subrecord('MAST', "$options{master}\0"),
+			subrecord('DATA', pack('V2', $options{master_size}, 0)),
+		);
+	}
+	my @records = record('TES3', 0, @header_subrecords);
+	foreach my $dialogue (@{$options{dialogues}}) {
+		push(
+			@records,
+			record(
+				'DIAL',
+				0,
+				subrecord('NAME', $dialogue->{topic}),
+				subrecord('DATA', pack('C', 0)),
+			),
+			record(
+				'INFO',
+				0,
+				subrecord('INAM', $dialogue->{id}),
+				subrecord('NAME', $dialogue->{response}),
+			),
+		);
+	}
+	return join('', @records);
+}
+
 sub make_install {
 	my $installation = tempdir(CLEANUP => 1);
 	my $data_files = File::Spec->catdir($installation, 'Data Files');
@@ -109,7 +150,7 @@ subtest 'master cache reuse requires matching schema, codec, and source bytes' =
 	my $cache = File::Spec->catfile($installation, 'tes3cmd', 'cache', 'master.esm.cache');
 	ok(-f $cache, 'master cache is created');
 	my $stored = retrieve($cache);
-	is($stored->{schema_version}, 1, 'master cache records its schema');
+	is($stored->{schema_version}, 2, 'master cache records its schema');
 	is($stored->{codec_version}, '0.3', 'master cache records its codec version');
 	like($stored->{source}->{sha256}, qr/^[0-9a-f]{64}$/, 'master cache records a SHA-256 source fingerprint');
 
@@ -123,12 +164,12 @@ subtest 'master cache reuse requires matching schema, codec, and source bytes' =
 	is(read_binary($cache), $cache_bytes, '--no-cache leaves the master cache untouched');
 
 	$stored = retrieve($cache);
-	$stored->{schema_version} = 0;
+	$stored->{schema_version} = 1;
 	store($stored, $cache);
 	my $schema = run_clean($installation, $probe);
 	is($schema->{exit}, 0, 'schema mismatch is rebuilt successfully');
 	like($schema->{stdout} . $schema->{stderr}, qr/schema mismatch/, 'schema mismatch is reported');
-	is(retrieve($cache)->{schema_version}, 1, 'schema mismatch is replaced with the current schema');
+	is(retrieve($cache)->{schema_version}, 2, 'schema mismatch is replaced with the current schema');
 
 	$stored = retrieve($cache);
 	$stored->{codec_version} = 'old-codec';
@@ -142,7 +183,7 @@ subtest 'master cache reuse requires matching schema, codec, and source bytes' =
 	my $corrupt = run_clean($installation, $probe);
 	is($corrupt->{exit}, 0, 'corrupted cache is rebuilt successfully');
 	like($corrupt->{stdout} . $corrupt->{stderr}, qr/Cache|Storable|retrieve/i, 'corrupted cache is reported');
-	is(retrieve($cache)->{schema_version}, 1, 'corrupted cache is replaced with valid data');
+	is(retrieve($cache)->{schema_version}, 2, 'corrupted cache is replaced with valid data');
 };
 
 subtest 'same-size master changes cannot drive stale cleaning decisions' => sub {
@@ -166,6 +207,48 @@ subtest 'same-size master changes cannot drive stale cleaning decisions' => sub 
 	like(run_tes3cmd($installation, 'dump', '--type', 'GMST', $target)->{stdout}, qr/iCacheValue/, 'target record is not deleted using stale master data');
 	ok(!-e File::Spec->catfile($data_files, 'Clean_Target.esp'), 'no stale cleaned output is produced');
 	isnt(retrieve($cache)->{source}->{sha256}, $old_fingerprint, 'rebuilt cache fingerprints current master bytes');
+};
+
+subtest 'duplicate INFO lookup is scoped to its parent DIAL' => sub {
+	my ($installation, $data_files) = make_install();
+	my $master = File::Spec->catfile($data_files, 'Master.esm');
+	my $target = File::Spec->catfile($data_files, 'Target.esp');
+	write_binary(
+		$master,
+		dialogue_plugin_bytes(
+			is_master => 1,
+			dialogues => [
+				{topic => 'topic a', id => 'shared-info', response => 'master response a'},
+				{topic => 'topic b', id => 'shared-info', response => 'master response b'},
+			],
+		),
+	);
+	write_binary(
+		$target,
+		dialogue_plugin_bytes(
+			master => 'Master.esm',
+			master_size => -s $master,
+			dialogues => [
+				{topic => 'topic a', id => 'shared-info', response => 'master response b'},
+				{topic => 'topic b', id => 'shared-info', response => 'master response b'},
+			],
+		),
+	);
+
+	my $result = run_clean($installation, $target);
+	is($result->{exit}, 0, 'dialogue duplicate cleaning succeeds');
+	my $cleaned = File::Spec->catfile($data_files, 'Clean_Target.esp');
+	ok(-f $cleaned, 'the genuine duplicate produces cleaned output');
+	my $dump = run_tes3cmd(
+		$installation,
+		'dump',
+		'--type',
+		'INFO',
+		$cleaned,
+	);
+	is($dump->{exit}, 0, 'cleaned dialogue output can be read');
+	like($dump->{stdout}, qr/Topic:topic a/, 'the non-duplicate INFO remains under its parent topic');
+	unlike($dump->{stdout}, qr/Topic:topic b/, 'the genuine duplicate INFO is removed');
 };
 
 subtest 'leveled-list cache tracks source bytes and --no-cache leaves it untouched' => sub {
