@@ -111,6 +111,18 @@ tes3cmd dump --list "My Mod.esp"
 tes3cmd diff old.esp new.esp > changes.txt
 ```
 
+Report changed definitions across an explicit or active load order:
+
+```sh
+tes3cmd conflicts Morrowind.esm Translation.esp GameplayMod.esp
+tes3cmd conflicts --active --type NPC_ --type DIAL
+```
+
+`conflicts` treats its input order as load order, identifies the final winning
+plugin, and lists changed subrecord types. Byte-identical duplicates are hidden
+unless `--all` is used. The report is informational and never modifies or
+merges plugins.
+
 Write a text dump to a file:
 
 ```sh

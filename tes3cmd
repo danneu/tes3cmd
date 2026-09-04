@@ -97,6 +97,8 @@ our @opt_type = ();
 our $opt_active_off;
 our $opt_active_on;
 
+our $opt_conflicts_all;
+
 our $opt_clean_all = 0;
 our $opt_clean_instances = 0;
 our $opt_clean_cell_params = 0;
@@ -5289,6 +5291,55 @@ tes3cmd common "my plugin.esp" "Morrowind.esm"
 },
      },
 
+     conflicts =>
+     { description => qq{Report changed record definitions across a load order},
+       options => [@STDOPT,
+		   'active',
+		   'all' => \$opt_conflicts_all,
+		   'exact-id=s@',
+		   'id=s@',
+		   'type=s@'],
+       preprocess => \&cmd_conflicts,
+       usage => qq{Usage: tes3cmd conflicts OPTIONS plugin1 plugin2 [plugin...]
+
+OPTIONS:
+ --active
+	use active plugins in their configured load order. If plugins are also
+	given, only active plugins with those names are included.
+
+ --all
+	include byte-identical duplicate definitions, which are hidden by default
+
+ --exact-id* <id-string>
+	only report records whose IDs exactly match the given string
+
+ --id* <id-regex>
+	only report records whose IDs match the regular expression
+
+ --type* <record-type>
+	only report records with the given record type
+
+DESCRIPTION:
+
+Reports records with the same type and ID in two or more input plugins. Input
+order is load order, so the final definition is marked as the winner. Each
+later definition is compared with the preceding one and lists the subrecord
+types that changed. Record flags are reported as FLAGS.
+
+Byte-identical duplicate chains are counted but hidden unless --all is used.
+The report is descriptive: an override is not necessarily an error, and this
+command never changes or merges plugins.
+
+EXAMPLES:
+
+# Report changed definitions across the active load order:
+tes3cmd conflicts --active
+
+# Report NPC and dialog conflicts in an explicit load order:
+tes3cmd conflicts --type NPC_ --type DIAL base.esm translation.esp mod.esp
+},
+     },
+
      delete =>
      { description => qq{Delete records/subrecords/object instances from plugin},
        options => [@STDOPT,
@@ -8961,6 +9012,131 @@ sub cmd_common {
 	}
     };
     read_records($plugin2, $compare_fun);
+}
+
+sub conflict_record_summary {
+    my($tr) = @_;
+    my %subrecord_data;
+    my @subrecord_order;
+    my @parts = TES3::Record::parse_subrecords(
+	$tr->recbuf,
+	$tr->rectype,
+	$tr->{_plugin_},
+	$tr->{_offset_},
+    );
+    while (my($subtype, $subbuf) = splice(@parts, 0, 2)) {
+	push(@subrecord_order, $subtype);
+	$subrecord_data{$subtype} .= pack('V', length($subbuf)) . $subbuf;
+    }
+    my %subrecords = map {
+	$_ => Digest::SHA::sha256_hex($subrecord_data{$_})
+    } keys %subrecord_data;
+    return({
+	digest => Digest::SHA::sha256_hex(pack('V', $tr->hdrflags) . $tr->recbuf),
+	flags => $tr->hdrflags,
+	order => Digest::SHA::sha256_hex(join('', @subrecord_order)),
+	subrecords => \%subrecords,
+    });
+}
+
+sub conflict_changes {
+    my($previous, $current) = @_;
+    my @changed;
+    push(@changed, 'FLAGS') if ($previous->{flags} != $current->{flags});
+    push(@changed, 'ORDER') if ($previous->{order} ne $current->{order});
+    my %subtypes = map { $_, 1 }
+	(keys %{$previous->{subrecords}}, keys %{$current->{subrecords}});
+    foreach my $subtype (sort keys %subtypes) {
+	my $before = $previous->{subrecords}->{$subtype};
+	my $after = $current->{subrecords}->{$subtype};
+	push(@changed, $subtype)
+	    if (not defined($before) or not defined($after) or $before ne $after);
+    }
+    return(@changed);
+}
+
+sub cmd_conflicts {
+    my(@plugins) = @_;
+    abort('conflicts requires at least two plugins in load order')
+	unless (@plugins >= 2);
+
+    my %basename_count;
+    $basename_count{lc(File::Basename::basename($_))}++ foreach @plugins;
+    my @labels = map {
+	my $basename = File::Basename::basename($_);
+	($basename_count{lc($basename)} > 1) ? $_ : $basename;
+    } @plugins;
+
+    my %records;
+    foreach my $index (0 .. $#plugins) {
+	my $plugin = $plugins[$index];
+	$CURRENT_DIAL = undef;
+	read_records($plugin, sub {
+	    my($rectype, $id, $tr) = @_;
+	    return if ($rectype eq 'TES3' or not defined($id));
+	    return if ($WANTED_TYPES and not $WANTED_TYPES->{$rectype});
+	    return if ($WANTED_IDS and $id !~ /$WANTED_IDS/i);
+	    my $context = ($rectype eq 'INFO') ? $CURRENT_DIAL : undef;
+	    my $identity = defined($context) ? "$context\000$id" : $id;
+	    my $entry = $records{$rectype}->{$identity} ||= {
+		context => $context,
+		definitions => {},
+		id => $id,
+	    };
+	    $entry->{definitions}->{$index} = conflict_record_summary($tr);
+	});
+    }
+
+    my $changed_conflicts = 0;
+    my $identical_conflicts = 0;
+    foreach my $rectype (sort keys %records) {
+	foreach my $identity (sort keys %{$records{$rectype}}) {
+	    my $entry = $records{$rectype}->{$identity};
+	    my $definitions = $entry->{definitions};
+	    my @indices = sort {$a <=> $b} keys %{$definitions};
+	    next unless (@indices >= 2);
+	    my $first_digest = $definitions->{$indices[0]}->{digest};
+	    my $identical = not grep {
+		$definitions->{$_}->{digest} ne $first_digest
+	    } @indices[1 .. $#indices];
+	    if ($identical) {
+		$identical_conflicts++;
+		next unless ($opt_conflicts_all);
+	    } else {
+		$changed_conflicts++;
+	    }
+
+	    print qq{$rectype "$entry->{id}"};
+	    print qq{ ($entry->{context})} if (defined $entry->{context});
+	    print($identical ? " [identical]\n" : "\n");
+	    my $previous;
+	    foreach my $position (0 .. $#indices) {
+		my $index = $indices[$position];
+		my $definition = $definitions->{$index};
+		my @notes;
+		push(@notes, 'winner') if ($position == $#indices);
+		if (defined $previous) {
+		    my @changed = conflict_changes($previous, $definition);
+		    push(@notes, @changed ? 'changed: ' . join(', ', @changed) : 'identical');
+		}
+		push(@notes, 'deleted') if ($definition->{flags} & $HDR_FLAGS{deleted});
+		print '  ' . $labels[$index];
+		print ' [' . join('; ', @notes) . ']' if (@notes);
+		print "\n";
+		$previous = $definition;
+	    }
+	    print "\n";
+	}
+    }
+
+    my $changed_word = ($changed_conflicts == 1) ? 'conflict' : 'conflicts';
+    print "[$changed_conflicts changed $changed_word";
+    if ($identical_conflicts) {
+	my $identical_word = ($identical_conflicts == 1) ? 'duplicate' : 'duplicates';
+	my $visibility = $opt_conflicts_all ? '' : ' hidden';
+	print "; $identical_conflicts identical $identical_word$visibility";
+    }
+    print "]\n";
 }
 
 sub cmd_diff {
