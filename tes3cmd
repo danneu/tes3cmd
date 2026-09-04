@@ -3040,51 +3040,85 @@ sub new_from_recbuf {
 
 # factory that creates new TES3::Records from reading records from filehandle
 my $hdr_size = 16;
+sub read_record_payload {
+    my($fh, $reclen, $plugin, $rectype, $record_offset, $reader) = @_;
+    my $payload_offset = tell($fh);
+    my $file_size = -s $fh;
+    if (defined($payload_offset) and defined($file_size)) {
+	my $available = $file_size - $payload_offset;
+	if ($reclen > $available) {
+	    abort(qq{$reader(): Read Error ($plugin record at byte: $record_offset, rec_type="$rectype"): asked for $reclen bytes, got $available});
+	}
+    }
+
+    my $recbuf = '';
+    while (length($recbuf) < $reclen) {
+	my $n_read = read($fh, $recbuf, $reclen - length($recbuf), length($recbuf));
+	abort(qq{$reader(): Read Error ($plugin record at byte: $record_offset, rec_type="$rectype"): $!})
+	    unless defined $n_read;
+	last unless $n_read;
+    }
+    if (length($recbuf) != $reclen) {
+	abort(qq{$reader(): Read Error ($plugin record at byte: $record_offset, rec_type="$rectype"): asked for $reclen bytes, got @{[length($recbuf)]}});
+    }
+    return($recbuf);
+}
+
+sub parse_subrecords {
+    my($recbuf, $rectype, $plugin, $record_offset, $collect) = @_;
+    $collect = 1 unless defined $collect;
+    $plugin ||= $CURRENT_PLUGIN || '<memory>';
+    my @parts;
+    my $p = 0;
+    my $reclen = length($recbuf);
+    while ($p < $reclen) {
+	my $remaining = $reclen - $p;
+	my $absolute_offset = defined($record_offset) ? $record_offset + $hdr_size + $p : $p;
+	if ($remaining < 8) {
+	    abort(qq{Malformed plugin "$plugin", record "$rectype" subrecord header at byte: $absolute_offset: needed 8 bytes, got $remaining});
+	}
+	my($subtype, $sublen) = unpack('a4L', substr($recbuf, $p, 8));
+	$p += 8;
+	$remaining = $reclen - $p;
+	if ($sublen > $remaining) {
+	    abort(qq{Malformed plugin "$plugin", subrecord $rectype.$subtype at byte: $absolute_offset: declares $sublen bytes, only $remaining remain});
+	}
+	push(@parts, $subtype, substr($recbuf, $p, $sublen)) if $collect;
+	$p += $sublen;
+    }
+    return(@parts);
+}
+
 sub new_from_input {
     my($class, $fh, $expected_type, $plugin) = @_;
+    my $record_offset = tell($fh);
     my $rec_hdr = "";
     my $n_read = read($fh, $rec_hdr, $hdr_size);
     if (not $n_read) {
 	if (defined $n_read) {
 	    return(undef);	# EOF
 	} else {
-	    abort(qq{Error on read() ($!)});
+	    abort(qq{new_from_input(): Read Error ($plugin header at byte: $record_offset): $!});
 	}
     }
     if ($n_read != $hdr_size) {
-	my $inp_offset = tell($fh) - $n_read;
-	# TBD: this condition indicates file corruption. it would be good to attempt to rewind and scan ahead for next viable record
-	abort(qq{new_from_input(): Read Error on header (at byte: $inp_offset): asked for $hdr_size bytes, got $n_read});
+	abort(qq{new_from_input(): Read Error ($plugin header at byte: $record_offset): asked for $hdr_size bytes, got $n_read});
     }
     # I suspect $reclen2 is the high word of a 64-bit double long, it is effectively unused.
     my($rectype, $reclen, $reclen2, $hdrflags) = unpack("a4LLL", $rec_hdr);
     return(undef) unless defined $rectype;
     if (not $TES3::Record::RECTYPES{$rectype}) {
-	my $inp_offset = tell($fh) - $n_read;
-	err(qq{new_from_input(): Type Error (at byte: $inp_offset): Unknown Record Type: "$rectype"});
-	# create a phony object for unknown record
-	no strict "refs";
-	my $method;
-	$method = "${rectype}::decode";
-	*$method = sub { return($_[0]); };
-	$method = "${rectype}::id";
-	*$method = sub { return("(unknown)"); };
-	$method = "${rectype}::tostr";
-	*$method = sub { return(""); };
+	abort(qq{new_from_input(): Type Error ($plugin at byte: $record_offset): Unknown Record Type: "$rectype"});
     }
     if (defined($expected_type) and $expected_type ne $rectype) {
-	my $inp_offset = tell($fh) - $n_read;
-	msg(qq{new_from_input(): Type Error (at byte: $inp_offset): Expected: "$expected_type", got: "$rectype"});
+	abort(qq{new_from_input(): Type Error ($plugin at byte: $record_offset): Expected: "$expected_type", got: "$rectype"});
     }
-    my $recbuf = "";
-    $n_read = read($fh, $recbuf, $reclen);
-    if ($n_read != $reclen) {
-	my $inp_offset = tell($fh) - $n_read;
-	# TBD: this condition indicates file corruption. it would be good to attempt to rewind and scan ahead for next viable record
-	abort(qq{new_from_input(): Read Error (at byte: $inp_offset, rec_type="$rectype"): asked for $reclen bytes, got $n_read});
-    }
+    my $recbuf = read_record_payload($fh, $reclen, $plugin, $rectype, $record_offset, 'new_from_input');
+    parse_subrecords($recbuf, $rectype, $plugin, $record_offset, 0);
     return(bless({ _rectype_ => $rectype,
 		   _hdrflags_ => $hdrflags,
+		   _plugin_ => $plugin,
+		   _offset_ => $record_offset,
 		   _recbuf_ => $recbuf }, $rectype)); # return a TES3 object
 } # new_from_input
 
@@ -3132,32 +3166,12 @@ sub decode {
     # decode the subrecords for this record
     my $rectype = $self->{_rectype_};
     my $recbuf = $self->{_recbuf_} or abort("decode(): recbuf not set: ".Dumper($self));
-    my @parts = eval { unpack("(a4L/a*)*", $recbuf); };
-    if ($@) {
-	# eval'ed unpack choked, so try a safer (slightly slower) decoder
-	@parts = ();
-	my $p = 0;
-	my $reclen = length($recbuf);
-	while ($p < $reclen) {
-	    my($subtype, $sublen) = unpack("a4L", substr($recbuf, $p));
-	    $p += 8;
-	    if (defined $sublen) { # MultiMark.esp, I'm looking at you
-		my $subbuf = substr($recbuf, $p, $sublen);
-		if (defined $subbuf) {
-		    push(@parts, $subtype, $subbuf);
-		} else {
-		    err("tr->decode(): ${rectype}.${subtype} has malformed subbuf");
-		}
-		$p += $sublen;
-	    } else {
-		if ($TES3::Record::RECTYPES{$rectype}->{$subtype}) {
-		    err("tr->decode(): ${rectype}.${subtype} has malformed recbuf");
-		} else {
-		    err(qq{tr->decode(): $rectype has malformed subtype: "$subtype"});
-		}
-	    }
-	}
-    }
+    my @parts = parse_subrecords(
+	$recbuf,
+	$rectype,
+	$self->{_plugin_},
+	$self->{_offset_},
+    );
     $CURRENT_GROUP = undef;
     while (my($subtype, $subbuf) = splice(@parts, 0, 2)) {
 	my $tsr = {};
@@ -6693,6 +6707,7 @@ my %JUNKCELL_SUBTYPE = (NAME => 1, DATA => 1, RGNN => 1);
 
 sub read_rec {
     my($fh, $expected_type, $plugin) = @_;
+    my $record_offset = tell($fh);
     my $rec_hdr = "";
     my $n_read = read($fh, $rec_hdr, $hdr_size);
     if (not $n_read) {
@@ -6716,17 +6731,15 @@ sub read_rec {
 	my $inp_offset = tell($fh) - $n_read;
 	abort(qq{read_rec(): Error ($plugin at byte: $inp_offset): Expected: "$expected_type", got: "$rectype"});
     }
-    my $recbuf = "";
-    $n_read = read($fh, $recbuf, $reclen);
-    if ($n_read != $reclen) {
-	my $inp_offset = tell($fh) - $n_read;
-	abort(qq{read_rec(): Read Error ($plugin record at byte: $inp_offset, rec_type="$rectype"): asked for $reclen bytes, got $n_read});
-    }
+    my $recbuf = TES3::Record::read_record_payload(
+	$fh, $reclen, $plugin, $rectype, $record_offset, 'read_rec',
+    );
     return($rectype, $recbuf, $hdrflags);
 }
 
 sub read_quick_parse {
     my($fh, $expected_type, $plugin) = @_;
+    my $record_offset = tell($fh);
     # read a record
     my $rec_hdr = "";
     my $n_read = read($fh, $rec_hdr, $hdr_size);
@@ -6751,44 +6764,16 @@ sub read_quick_parse {
 	my $inp_offset = tell($fh) - $n_read;
 	abort(qq{read_quick_parse(): Error ($plugin at byte: $inp_offset): Expected: "$expected_type", got: "$rectype"});
     }
-    my $recbuf = "";
-    $n_read = read($fh, $recbuf, $reclen);
-    if ($n_read != $reclen) {
-	my $inp_offset = tell($fh) - $n_read;
-	abort(qq{read_quick_parse(): Read Error ($plugin record at byte: $inp_offset, rec_type="$rectype"): asked for $reclen bytes, got $n_read});
-    }
+    my $recbuf = TES3::Record::read_record_payload(
+	$fh, $reclen, $plugin, $rectype, $record_offset, 'read_quick_parse',
+    );
     # parse record into a subrecs hash
     my %subrecs;	# hash of (subtype => subbuf_list);
-    eval {
-	my @parts = unpack("(a4L/a*)*", $recbuf);
-	while (my($subtype, $subbuf) = splice(@parts, 0, 2)) {
-	    push(@{$subrecs{$subtype}}, $subbuf);
-	}
-    };
-    if ($@) {
-	# eval'ed unpack choked, so try a safer (slightly slower) decoder
-	%subrecs = ();
-	my $p = 0;
-	my $reclen = length($recbuf);
-	while ($p < $reclen) {
-	    my($subtype, $sublen) = unpack("a4L", substr($recbuf, $p));
-	    $p += 8;
-	    if (defined $sublen) { # MultiMark.esp, I'm looking at you
-		my $subbuf = substr($recbuf, $p, $sublen);
-		if (defined $subbuf) {
-		    push(@{$subrecs{$subtype}}, $subbuf);
-		} else {
-		    err("read_quick_parse(): ${rectype}.${subtype} has malformed subbuf");
-		}
-		$p += $sublen;
-	    } else {
-		if ($TES3::Record::RECTYPES{$rectype}->{$subtype}) {
-		    err("read_quick_parse(): ${rectype}.${subtype} has malformed recbuf");
-		} else {
-		    err(qq{read_quick_parse(): $rectype has malformed subtype: "$subtype"});
-		}
-	    }
-	}
+    my @parts = TES3::Record::parse_subrecords(
+	$recbuf, $rectype, $plugin, $record_offset,
+    );
+    while (my($subtype, $subbuf) = splice(@parts, 0, 2)) {
+	push(@{$subrecs{$subtype}}, $subbuf);
     }
     # calculate record id
     my $id;
@@ -7020,8 +7005,10 @@ sub read_records {
     my($plugin, $fun) = @_;
     my $inp = open_for_input($plugin);
     my %plugin_id = ();
+    my $expected = 'TES3';
     eval {
-	while (my $tr = TES3::Record->new_from_input($inp, undef, $plugin)) {
+	while (my $tr = TES3::Record->new_from_input($inp, $expected, $plugin)) {
+	    $expected = undef;
 	    next if ($tr->hdrflags & $HDR_FLAGS{ignored});
 	    my $id = $tr->decode()->id;
 	    if ($fun) {
@@ -7030,9 +7017,15 @@ sub read_records {
 		$plugin_id{$tr->rectype}->{$id} = 1 if (defined $id);
 	    }
 	}
+	abort(qq{Invalid plugin "$plugin": missing TES3 header}) if defined $expected;
+	close_checked($inp, qq{input "$plugin"});
+	$inp = undef;
     };
-    err($@) if ($@);
-    close_input($inp);
+    if ($@) {
+	my $error = $@;
+	close($inp) if defined($inp) and defined(fileno($inp));
+	die($error);
+    }
     return(\%plugin_id);
 }
 
@@ -7040,32 +7033,48 @@ sub read_objects {
     my($plugin) = @_;
     my $inp = open_for_input($plugin);
     my %plugin_id = ();
+    my $expected = 'TES3';
     eval {
-	while (my $tr = TES3::Record->new_from_input($inp, undef, $plugin)) {
+	while (my $tr = TES3::Record->new_from_input($inp, $expected, $plugin)) {
+	    $expected = undef;
 	    next if ($tr->hdrflags & $HDR_FLAGS{ignored});
 	    my $id = $tr->decode()->id;
 	    $plugin_id{$id}->{$tr->rectype} = $tr if (defined $id);
 	}
+	abort(qq{Invalid plugin "$plugin": missing TES3 header}) if defined $expected;
+	close_checked($inp, qq{input "$plugin"});
+	$inp = undef;
     };
-    err($@) if ($@);
-    close_input($inp);
+    if ($@) {
+	my $error = $@;
+	close($inp) if defined($inp) and defined(fileno($inp));
+	die($error);
+    }
     return(\%plugin_id);
 }
 
 sub read_dialogs {
     my($plugin, $dialref) = @_;
     my $inp = open_for_input($plugin);
+    my $expected = 'TES3';
     eval {
-	while (my $tr = TES3::Record->new_from_input($inp, undef, $plugin)) {
+	while (my $tr = TES3::Record->new_from_input($inp, $expected, $plugin)) {
+	    $expected = undef;
 	    next if ($tr->hdrflags & $HDR_FLAGS{ignored});
 	    next if ($tr->rectype ne "DIAL");
 	    my $id = $tr->decode()->id;
 	    my $type = $tr->get('DATA', 'type');
 	    $dialref->{$plugin}->{$id}++ if ($type == 0 and $id);
 	}
+	abort(qq{Invalid plugin "$plugin": missing TES3 header}) if defined $expected;
+	close_checked($inp, qq{input "$plugin"});
+	$inp = undef;
     };
-    err($@) if ($@);
-    close_input($inp);
+    if ($@) {
+	my $error = $@;
+	close($inp) if defined($inp) and defined(fileno($inp));
+	die($error);
+    }
 }
 
 sub master_cache_path {
@@ -7600,23 +7609,27 @@ sub buffalize {
 sub process_plugin_for_input {
     my($plugin, $fun) = @_;
     my $expected = "TES3";
+    my $inp;
     # TBD - to support using instance types, will need to load masters
     # process each record in the plugin
     eval {
-	my $inp = open_for_input($plugin);
+	$inp = open_for_input($plugin);
 	while (my $tr = TES3::Record->new_from_input($inp, $expected, $plugin)) {
 	    $expected = undef;
 	    $fun->($tr->{_rectype_}, $tr);
 	}
-	close_input($inp);
+	abort(qq{Invalid plugin "$plugin": missing TES3 header}) if defined $expected;
+	close_checked($inp, qq{input "$plugin"});
+	$inp = undef;
     };
     if ($@) {
-	if ($@ =~ /^Can't locate object method/) {
-	    warn qq{FATAL ERROR ($plugin): $@};
+	my $error = $@;
+	close($inp) if defined($inp) and defined(fileno($inp));
+	if ($error =~ /^Can't locate object method/) {
+	    die qq{FATAL ERROR ($plugin): $error};
 	} else {
-	    warn($@);
+	    die($error);
 	}
-	return(0);
     } else {
 	return(1);
     }
@@ -7660,6 +7673,7 @@ sub process_plugin_for_update {
 		$modified++;
 	    }
 	}
+	abort(qq{Invalid plugin "$plugin": missing TES3 header}) if defined $expected;
 	if ($prefix) {
 	    my($file, $dir) = fileparse($plugin);
 	    my $newname = ($dir eq './') ? "${prefix}${file}" : "${dir}${prefix}${file}";

@@ -74,7 +74,7 @@ subtest 'malformed input leaves the original in place and cleans up' => sub {
 	isnt($result->{exit}, 0, 'malformed input fails the command');
 	like(
 		$result->{stdout} . $result->{stderr},
-		qr/Read Error on header/,
+		qr/Read Error.*header/s,
 		'the malformed record is reported',
 	);
 	is(read_binary($plugin), $original, 'the malformed original is untouched');
