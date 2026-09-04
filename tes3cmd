@@ -1475,7 +1475,7 @@ use Text::Wrap qw(wrap);
 use Data::Dumper;
 use strict;
 
-our $CODEC_VERSION = "0.3";
+our $CODEC_VERSION = "0.4";
 our $MARGIN = "  ";
 our $GROUPMARGIN = " *";
 our $CURRENT_DIAL;
@@ -3330,7 +3330,9 @@ sub write_rec {
 	abort("null reclen: self=".Dumper($self)) if not defined $self->reclen;
 	abort("null hdrflags: self=".Dumper($self)) if not defined $self->hdrflags;
     }
-    $self->encode() unless (defined $self->{_recbuf_}); # TBD - should re-encode if modified! (but then new() should set modified flag???)
+    my $subrecord_changed = defined($self->{SL}) &&
+	grep { subrecord_is_dirty($_) } @{$self->{SL}};
+    $self->encode() if (not defined($self->{_recbuf_}) or $self->{_modified_} or $subrecord_changed);
     print $fh pack("a4LLLa*", $self->rectype, $self->reclen, (my $reclen2 = 0), $self->hdrflags, $self->recbuf)
 	or abort("writing record " . $self->rectype . " ($!)");
 }
@@ -3392,6 +3394,13 @@ sub decode {
 	# When we encounter a subrecord (tsr) with fieldname "id" we use that as the official ID for the record
 	# a few record types need custom methods to derive their unique record ID.
 	$self->{_id_} = lc($tsr->{id}) if (defined $tsr->{id}); # Note! record IDs are lowercased for easy comparison!
+	$tsr->{_original_subbuf_} = $subbuf;
+	if ($tsr->can('fieldnames')) {
+	    $tsr->{_original_fields_} = {
+		map { $_ => $tsr->{$_} } $tsr->fieldnames()
+	    };
+	}
+	$tsr->{_dirty_} = 0;
 	# inline $tr->append()
 	push(@{$self->{SL}}, $tsr);
 	push(@{$self->{SH}->{$subtype}}, $tsr);
@@ -3399,10 +3408,36 @@ sub decode {
     return($self);
 } # decode
 
-# tr->encode()
+# Return true when a subrecord must be re-encoded instead of passed through.
+sub subrecord_is_dirty {
+    my($tsr) = @_;
+    return(1) if ($tsr->{_dirty_});
+    my $original = $tsr->{_original_fields_};
+    return(0) unless defined($original);
+    foreach my $field (keys %{$original}) {
+	return(1) unless exists($tsr->{$field});
+	my($before, $after) = ($original->{$field}, $tsr->{$field});
+	return(1) if defined($before) != defined($after);
+	return(1) if defined($before) and $before ne $after;
+    }
+    return(0);
+}
+
+sub encode_subrecord {
+    my($tsr, $force) = @_;
+    if (not $force and not subrecord_is_dirty($tsr) and
+	defined($tsr->{_original_subbuf_})) {
+	return($tsr->{_original_subbuf_});
+    }
+    return($tsr->encode()->subbuf);
+}
+
+# tr->encode(FORCE_REENCODE)
 sub encode {
-    my($self) = @_;
-    $self->{_recbuf_} = join("", map { pack("a4L/a*", $_->subtype, $_->encode()->subbuf) } $self->subrecs());
+    my($self, $force) = @_;
+    $self->{_recbuf_} = join("", map {
+	pack("a4L/a*", $_->subtype, encode_subrecord($_, $force))
+    } $self->subrecs());
     return($self);
 }
 
@@ -3434,14 +3469,17 @@ set({f=>"count"}, 0)
 	    if (defined($tsr->{$key})) {
 		if ($tsr->{$key} ne $newval) {
 		    $tsr->{$key} = $newval;
+		    $tsr->{_dirty_} = 1;
 		    $self->{_modified_} = 1;
 		}
 	    }
 	} else {
 	    # set all fields
-	    while (my($key, $val) = each %{$tsr}) {
+	    foreach my $key (grep { !/^_/ } keys %{$tsr}) {
+		my $val = $tsr->{$key};
 		if ($val ne $newval) {
 		    $tsr->{$key} = $newval;
+		    $tsr->{_dirty_} = 1;
 		    $self->{_modified_} = 1;
 		}
 	    }
@@ -3631,6 +3669,7 @@ sub gen_subrec_methods {
 	my @fieldnames;
 	my %suffix_index;
 	my @formats;
+	my $preserve_trailing_nul;
 	my $lookup;
 	my $symflags;
 	foreach (@{$subdefref}) {
@@ -3651,6 +3690,8 @@ sub gen_subrec_methods {
 		    ($decode_fmt, $custom_format) = split(/:/, $decode_fmt, 2);
 		    $decode_pack_format .= ($pfmt = $decode_fmt);
 		    $encode_pack_format .= $encode_fmt;
+		    $preserve_trailing_nul = $fieldname
+			if ($decode_fmt eq 'Z*' and $encode_fmt eq 'a*');
 		} else {
 		    # standard definition pair
 		    ($fmt, $custom_format) = split(/:/, $fmt, 2);
@@ -3701,6 +3742,9 @@ sub gen_subrec_methods {
 		assert(scalar(@vals) == scalar(@fieldnames),
 		       "decode(): number of field values (@vals) does not match number of field names (@fieldnames)") if (ASSERT);
 		$self->{$_} = shift(@vals) foreach (@fieldnames);
+		$self->{_preserve_trailing_nul_} =
+		    (length($subbuf) and substr($subbuf, -1, 1) eq "\000") ? 1 : 0
+		    if defined($preserve_trailing_nul);
 		return($self);
 	    };
 	}
@@ -3712,6 +3756,8 @@ sub gen_subrec_methods {
 		use strict "refs";
 		my($self) = @_;
 		$self->{_subbuf_} = pack($encode_pack_format, map {$self->{$_}} @fieldnames);
+		$self->{_subbuf_} .= "\000"
+		    if (defined($preserve_trailing_nul) and $self->{_preserve_trailing_nul_});
 		return($self);
 	    };
 	}
@@ -3822,7 +3868,8 @@ sub gen_subrec_methods {
     *$method = sub {
 	use strict "refs";
 	my($class, $hashref, $parent) = @_;
-	$hashref->{_id_} = $parent->{_id_};
+	$hashref->{_id_} = $parent->{_id_} if defined($parent);
+	$hashref->{_dirty_} = 1;
 	bless($hashref, $class);
     };
 
@@ -3934,7 +3981,13 @@ sub gen_class {
     # $tr->hdrflags() - get/set _hdrflags_
     unless ($rectype->can('hdrflags')) {
 	$method = "${rectype}::hdrflags";
-	*$method = sub { ($_[1]) ? $_[0]->{_hdrflags_} = $_[1] : $_[0]->{_hdrflags_}; };
+	*$method = sub {
+	    if (@_ > 1) {
+		$_[0]->{_modified_} = 1 if $_[0]->{_hdrflags_} != $_[1];
+		$_[0]->{_hdrflags_} = $_[1];
+	    }
+	    return($_[0]->{_hdrflags_});
+	};
     }
 
     # tr->id() - get/set _id_
@@ -7784,6 +7837,7 @@ sub update_header {
 		if ($author ne $old_author) {
 		    $modified++;
 		    $tsr->{author} = $author;
+		    $tsr->{_dirty_} = 1;
 		    dbg("HEDR modified: author") if (DBG);
 		}
 	    }
@@ -7797,6 +7851,7 @@ sub update_header {
 		if ($description ne $old_description) {
 		    $modified++;
 		    $tsr->{description} = $description;
+		    $tsr->{_dirty_} = 1;
 		    dbg("HEDR modified: description: $opt_header_description") if (DBG);
 		}
 	    }
@@ -7807,6 +7862,7 @@ sub update_header {
 		    dbg("HEDR modified: record count") if (DBG);
 		    $update_msg .= qq{  $plugin: Updated Record Count: $tsr->{n_records} --> $count\n};
 		    $tsr->{n_records} = $count;
+		    $tsr->{_dirty_} = 1;
 		}
 	    }
 	}
@@ -7821,6 +7877,7 @@ sub update_header {
 			dbg("HEDR modified: synced masters") if (DBG);
 			$update_msg .= qq{  $plugin: Synchronized master "$master" length: $length --> $newlen\n};
 			$tsr->{length} = $newlen;
+			$tsr->{_dirty_} = 1;
 		    }
 		} else {
 		    err("Found DATA (size of master) but no corresponding MAST (name of master)");
@@ -8333,9 +8390,9 @@ sub cmd_testcodec {
 	my $id = $tr->decode()->id;
 	my $trnew = TES3::Record->new_from_recbuf($rectype, '', $tr->hdrflags);
 	foreach my $tsr ($tr->subrecs()) {
-	    my $oldsubrec = $tsr->subbuf;
+	    my $oldsubrec = $tsr->{_original_subbuf_};
 	    die "no buf: " . Dumper($tsr). "\n" if (not defined $oldsubrec);
-	    my $newsubrec = $tsr->encode()->subbuf;
+	    my $newsubrec = TES3::Record::encode_subrecord($tsr, 1);
 	    my $fulltype = $tsr->fulltype;
 	    unless ($exclude{$fulltype}) {
 		if ($newsubrec ne $oldsubrec) {
@@ -8356,7 +8413,7 @@ sub cmd_testcodec {
 	    }
 	    $trnew->append($tsr);
 	}
-	my $newrec = $trnew->encode()->recbuf;
+	my $newrec = $trnew->encode(1)->recbuf;
 	unless ($exclude{$rectype}) {
 	    if ((my $oldrec = $tr->recbuf) ne $newrec) {
 		if ($opt_testcodec_ignore_cruft and compare_records($oldrec, $newrec)) {
@@ -8943,6 +9000,8 @@ sub cmd_multipatch {
 		my $ambi_tsr = $tr->get('AMBI');
 		$ambi_tsr->{fog_density} = 0.01;
 		$data_tsr->{fog_density} = 0.01;
+		$ambi_tsr->{_dirty_} = 1;
+		$data_tsr->{_dirty_} = 1;
 		my $newcell = CELL->new([$name_tsr, $data_tsr->encode, $ambi_tsr->encode]);
 		$newcell->write_rec($out);
 	    }
@@ -9351,6 +9410,7 @@ sub cmd_delete {
 		}
 		if ($deletions) {
 		    $nam0_tsr->{reference_count} = $n;	# update NAM0
+		    $nam0_tsr->{_dirty_} = 1;
 		    dbg("newcell:".Dumper(\@newcell)) if (DBG);
 		    return(CELL->new([@newcell]));
 		} else {
@@ -9401,7 +9461,11 @@ sub cmd_modify {
 		    };
 		    abort(qq{Replacement failed for "$plugin" record $rectype "$id": $@})
 			unless ($ok);
-		    $modified = 1 if ($changed);
+		    if ($changed) {
+			$tsr->{_dirty_} = 1;
+			$tr->{_modified_} = 1;
+			$modified = 1;
+		    }
 		}
 	    }
 	} elsif ($opt_modify_run) {
@@ -9662,6 +9726,7 @@ sub cmd_clean {
 		}
 		if ($cell_modified) {
 		    $nam0_tsr->{reference_count} = $n;	# update NAM0
+		    $nam0_tsr->{_dirty_} = 1;
 		    #msg("newcell DUMP=".Dumper(\@newcell));
 		    $plug_tr = CELL->new([@newcell]);
 		    $record_modified++;
@@ -9870,6 +9935,7 @@ sub cmd_dump {
 	    }
 	    if ($selected) {
 		$nam0_tsr->{reference_count} = $n;	# update NAM0
+		$nam0_tsr->{_dirty_} = 1;
 		my $newtr = CELL->new([@newcell]);
 		if ($opt_dump_binary) {
 		    $newtr->write_rec($DUMP_OUTPUT);

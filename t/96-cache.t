@@ -151,7 +151,7 @@ subtest 'master cache reuse requires matching schema, codec, and source bytes' =
 	ok(-f $cache, 'master cache is created');
 	my $stored = retrieve($cache);
 	is($stored->{schema_version}, 2, 'master cache records its schema');
-	is($stored->{codec_version}, '0.3', 'master cache records its codec version');
+	is($stored->{codec_version}, '0.4', 'master cache records its codec version');
 	like($stored->{source}->{sha256}, qr/^[0-9a-f]{64}$/, 'master cache records a SHA-256 source fingerprint');
 
 	my $second = run_clean($installation, $probe);
@@ -177,7 +177,7 @@ subtest 'master cache reuse requires matching schema, codec, and source bytes' =
 	my $codec = run_clean($installation, $probe);
 	is($codec->{exit}, 0, 'codec mismatch is rebuilt successfully');
 	like($codec->{stdout} . $codec->{stderr}, qr/codec mismatch/, 'codec mismatch is reported');
-	is(retrieve($cache)->{codec_version}, '0.3', 'codec mismatch is replaced with the current codec');
+	is(retrieve($cache)->{codec_version}, '0.4', 'codec mismatch is replaced with the current codec');
 
 	write_binary($cache, 'not a Storable cache');
 	my $corrupt = run_clean($installation, $probe);
@@ -272,7 +272,7 @@ subtest 'leveled-list cache tracks source bytes and --no-cache leaves it untouch
 	ok(-f $cache, 'leveled-list cache is created');
 	my $stored = retrieve($cache);
 	is($stored->{_schema_version_}, 1, 'aggregate cache records its schema');
-	is($stored->{_codec_version_}, '0.3', 'aggregate cache records its codec');
+	is($stored->{_codec_version_}, '0.4', 'aggregate cache records its codec');
 	my $old_fingerprint = $stored->{'active.esp'}->{_source_}->{sha256};
 
 	my $contents = read_binary($active);
@@ -295,6 +295,14 @@ subtest 'leveled-list cache tracks source bytes and --no-cache leaves it untouch
 	is($schema->{exit}, 0, 'aggregate schema mismatch is rebuilt');
 	like($schema->{stdout} . $schema->{stderr}, qr/schema update/, 'aggregate schema mismatch is reported');
 	is(retrieve($cache)->{_schema_version_}, 1, 'aggregate cache is rewritten with the current schema');
+
+	$stored = retrieve($cache);
+	$stored->{_codec_version_} = 'old-codec';
+	store($stored, $cache);
+	my $codec = run_tes3cmd($installation, @command, '--overwrite');
+	is($codec->{exit}, 0, 'aggregate codec mismatch is rebuilt');
+	like($codec->{stdout} . $codec->{stderr}, qr/codec update/i, 'aggregate codec mismatch is reported');
+	is(retrieve($cache)->{_codec_version_}, '0.4', 'aggregate cache is rewritten with the current codec');
 };
 
 done_testing;
