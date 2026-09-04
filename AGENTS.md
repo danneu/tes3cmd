@@ -6,13 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 tes3cmd is a command line tool for examining and modifying plugins (.esp/.esm) for
 Morrowind (TES3). The entire program is one Perl script, `tes3cmd` (~9500 lines).
-There is no build system, no test suite, and no module layout; `Docs/Notes.txt` is
-the author's TODO list and `ChangeLog` summarizes releases.
+There is no build system or module layout. The behavioral test suite lives in `t/`;
+`Docs/Notes.txt` is the author's historical TODO list and `ChangeLog` summarizes
+releases.
 
 ## Commands
 
 ```sh
 perl -c tes3cmd                      # syntax check (the only "build" step)
+prove -lr t                          # behavioral test suite
+just test                            # run the suite with dependencies supplied by Nix
 perl tes3cmd help                    # list commands; `help <command>` for one
 perl tes3cmd dump --debug foo.esp    # --debug/-d, --verbose/-v, --assert are global
 perl tes3cmd -testcodec foo.esp      # decode+re-encode every record, report mismatches
@@ -20,10 +23,12 @@ perl tes3cmd -shell                  # Perl REPL with TES3 packages loaded
 pp -o tes3cmd.exe tes3cmd            # Windows build with Par::Packer
 ```
 
-The closest thing to a test is `-testcodec`: it round-trips each subrecord through
-decode/encode and prints CODEC FAILURE on any byte difference. Run it against a real
-plugin after touching `@RECDEFS`. Use `--ignore-cruft` to tolerate trailing junk and
-`-x TYPE` to exclude a subrecord type.
+The automated suite uses generated plugin fixtures for CLI, codec, parsing, output,
+and file-transaction behavior. `-testcodec` remains the real-plugin integration
+check: it round-trips each subrecord through decode/encode and prints CODEC FAILURE
+on any byte difference. Run it against representative real plugins after touching
+`@RECDEFS`. Use `--ignore-cruft` to tolerate trailing junk and `-x TYPE` to exclude
+a subrecord type.
 
 Note that `DBG`, `ASSERT`, `VERBOSE`, and `WRAP` are compile-time constants set in
 `BEGIN` blocks by scanning `@ARGV`, so they must appear on the command line, not be
@@ -32,11 +37,12 @@ set from code.
 ## Runtime environment
 
 `TES3::Util::find_morrowind()` walks up from the cwd looking for a directory containing
-both `Data Files` and `Morrowind.ini`. If found, `$MWDIR/tes3cmd/` is created and used
-for backups and `cache/*.cache` (Storable dumps of master records). If not found, the
-tool warns, sets everything to `.`, and disables caching. Running from any directory
-outside a Morrowind install therefore works but with "reduced functionality"
-(no load order, `--active`, master lookups).
+both `Data Files` and `Morrowind.ini`, or accepts `--morrowind-dir`/`--data-files`.
+Discovery itself does not create directories. Commands that cache master data use
+`$MWDIR/tes3cmd/cache/*.cache` (Storable dumps). If no installation is found, the
+tool uses `.` and disables caching. Plain `dump` and `diff` with explicit paths work
+quietly outside an installation; load order, `--active`, and master lookups require
+one.
 
 ## Architecture of the single file
 
@@ -71,7 +77,8 @@ options, expands globs, applies `--ignore-plugin` and `--active`, calls `get_wan
 to compile `--type/--id/--flag` selectors, then runs `preprocess(@plugins)`,
 `process($plugin)` once per plugin, and `postprocess(@plugins)`. Names not in
 `%COMMAND` are tried as user extension files (`foo` or `foo.pl`) loaded with
-`load_perl`, which `eval`s them and expects a `%COMMAND`-style hashref back.
+`load_perl`, which `eval`s them and expects a `%COMMAND`-style hashref back. This
+filename-based extension path is deprecated and executes trusted, unsandboxed Perl.
 
 The `usage` string is the help text; `help` reads `description` and `usage`
 from the table, so a new command needs nothing else registered.
@@ -86,12 +93,13 @@ Almost every command is built on two helpers:
   file. The callback's return value decides the outcome: `undef` deletes the record,
   a false value passes the original through unchanged, and a record object writes
   that (re-encoded) record. `fix_output` then renames over the original with a
-  backup in `$opt_backup_dir`, or writes to `$prefix$plugin` when a prefix is given
-  (e.g. `-testcodec` writes `test_foo.esp`).
+  numbered backup beside the input (or in `$opt_backup_dir` with `--hide-backups`),
+  or writes to `$prefix$plugin` when a prefix is given (e.g. `-testcodec` writes
+  `test_foo.esp`).
 
 `rec_match` applies the `--type`, `--id`, `--exact-id`, `--flag`, `--match`,
 `--no-match`, `--interior/--exterior`, and instance selectors; commands like
-`dump`, `delete`, `modify`, and `run` all go through it.
+`dump`, `delete`, and `modify` all go through it.
 
 ## Related repo
 
