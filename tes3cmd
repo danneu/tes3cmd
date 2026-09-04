@@ -6211,13 +6211,13 @@ tes3cmd modify --type cont --run "\$R->set({i=>[-3..-1],f=>'count'}, 4)" ale_clo
 		   'summons-persist' => \$opt_multipatch_summons_persist],
 
        preprocess => sub {
+	   abort("--merge-objects is not supported")
+	       if ($opt_multipatch_merge_objects);
 	   unless ($opt_multipatch_cellnames or $opt_multipatch_fogbug or
-		   $opt_multipatch_merge_lists or $opt_multipatch_summons_persist or
-		   $opt_multipatch_merge_objects) {
+		   $opt_multipatch_merge_lists or $opt_multipatch_summons_persist) {
 	       # by default turn on all options if none are selected
 	       $opt_multipatch_cellnames = $opt_multipatch_fogbug =
-		   $opt_multipatch_merge_lists = $opt_multipatch_merge_objects =
-		   $opt_multipatch_summons_persist = 1;
+		   $opt_multipatch_merge_lists = $opt_multipatch_summons_persist = 1;
 	   }
 	   %LEVC::user_delete_creature = map { lc, 1 } @opt_multipatch_delete_creature;
 	   %LEVI::user_delete_item = map { lc, 1 } @opt_multipatch_delete_item;
@@ -6248,9 +6248,7 @@ OPTIONS:
 	--delete-item*|--di* <item-id>
 
  --merge-objects
-	merges leveled lists used in your active plugins. Note that when you
-	use this feature, you do NOT also need other merged object plugins like
-	"Merged_Objects.esp" from TesTool. (NOT IMPLEMENTED YET).
+	unsupported; this option is retained only to report a clear error
 
  --no-activate
 	do not automatically activate multipatch.esp
@@ -6273,7 +6271,7 @@ be safe to use it with no options to get the default patching behavior (if you
 do find any problems, please report them and they will be fixed ASAP). When no
 options are specified, the following default options are assumed:
 
-  --cellnames --fogbug --merge-lists --merge-objects --summons-persist
+  --cellnames --fogbug --merge-lists --summons-persist
 
 The different patching operations are explained below:
 
@@ -6307,12 +6305,6 @@ Merge Leveled Lists (--merge-lists)
 
   This feature is similar to what you get with Wrye Mash's "Mashed Lists.esp".
   However, you should not use more than one plugin to merge leveled lists.
-
-Merge Objects (--merge-objects)
-
-  This feature is similar to what you get with TesTools's "Merged_Objects.esp".
-  However, you should not use more than one plugin to merge objects.
-  (NOT IMPLEMENTED YET)
 
 Summoned creatures persists (--summons-persist)
 
@@ -8076,8 +8068,8 @@ sub cmd_fixit {
 	cmd_clean($CURRENT_PLUGIN = $path)
     }
     # generate all patches
-    $opt_multipatch_cellnames = $opt_multipatch_fogbug = $opt_multipatch_merge_lists =
-	$opt_multipatch_merge_objects = $opt_multipatch_summons_persist = 1;
+    $opt_multipatch_cellnames = $opt_multipatch_fogbug =
+	$opt_multipatch_merge_lists = $opt_multipatch_summons_persist = 1;
     cmd_multipatch();
     # synchronize plugin headers to masters
     prn("\n\nSynchronizing Plugin Headers...");
@@ -8532,7 +8524,6 @@ sub cmd_multipatch {
     my %fogcell;		# fogbugged cells
     my %rencell;		# cells with reverted renamings
     my %sumcrea;		# critters needing persistent flag
-    my $merged_objects = multipatch_merge_objects() if ($opt_multipatch_merge_objects);
     my $merged_lists = multipatch_merge_leveled_lists_old() if ($opt_multipatch_merge_lists);
     foreach my $plugin ($T3->load_order()) {
 	$CURRENT_PLUGIN = $plugin;
@@ -8591,7 +8582,7 @@ sub cmd_multipatch {
     my $nfogbugs = scalar keys %fogcell;
     my $nrenrevs = scalar(grep {defined} map {$_->{OUTPUTFLAG}} values(%rencell));
     my $nsumcrea = scalar keys %sumcrea;
-    if ($nfogbugs or $nrenrevs or $nsumcrea or $merged_lists or $merged_objects) {
+    if ($nfogbugs or $nrenrevs or $nsumcrea or $merged_lists) {
 	print "\n".("="x75)."\n";
 	print "A multipatch has been conjured for you to address the following issues:\n";
 	abort(qq{Output destination "$patch_path" already exists (use --overwrite to overwrite)})
@@ -8636,16 +8627,6 @@ sub cmd_multipatch {
 		my $tr = $sumcrea{$id};
 		$tr->write_rec($out);
 	    }
-	}
-	if ($merged_objects) {
-	    my %count;
-	    my $total = 0;
-	    foreach my $tr (@$merged_lists) {
-		$count{$tr->rectype()}++;
-		$total++;
-		$tr->write_rec($out);
-	    }
-	    print "\nMerged Objects ($total)\n";
 	}
 	if ($merged_lists) {
 	    my %count;
