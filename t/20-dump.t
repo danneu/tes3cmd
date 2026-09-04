@@ -16,6 +16,7 @@ write_minimal_plugin($plugin);
 my $result = run_tes3cmd($workdir, 'dump', '--type', 'GMST', $plugin);
 
 is($result->{exit}, 0, 'dump succeeds for a minimal plugin');
+unlike($result->{stderr}, qr/Can't find "Data Files"/, 'standalone dump needs no installation warning');
 like(
 	$result->{stdout},
 	qr/Record: GMST "ites3cmdtest"/,

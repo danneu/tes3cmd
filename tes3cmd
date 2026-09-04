@@ -44,7 +44,19 @@ our $TES3CMD_DIR;		# tes3cmd directory ($MWDIR/tes3cmd)
 our $CACHE_DIR;			# cache directory ($MWDIR/tes3cmd/cache)
 
 ### MAIN COMMON COMMAND OPTIONS
-our @STDOPT = ("assert", "debug", "verbose"); # options for all commands
+our $opt_data_files;
+our $opt_help;
+our $opt_morrowind_dir;
+our $opt_version;
+our @STDOPT = (
+    "assert",
+    "debug",
+    'data-files=s'    => \$opt_data_files,
+    'help|h'          => \$opt_help,
+    'morrowind-dir=s' => \$opt_morrowind_dir,
+    "verbose",
+    'version|V'       => \$opt_version,
+); # options for all commands
 our @MODOPT = ("backup-dir=s", "hide-backups"); # options for commands that modify
 our $opt_active;				# limit processing to active plugins
 our $opt_output;				# specify output (default is STDOUT)
@@ -278,48 +290,56 @@ BEGIN {
 
 ### CLASS: TES3::Util
 
-# assuming the program is run somewhere under the Morrowind game directory, find the
-# location of the "Data Files" directory by walking up the hierarchy. Then create
-# TES3CMD_DIR if it does not already exist.
-# since find_morrowind() sets some global option ($opt_) defaults, run it before GetOptions()
+# Find the Morrowind installation explicitly or by walking up from the current
+# directory. Discovery only sets paths; commands create their own artifacts.
 sub find_morrowind {
+    my($requested_mwdir, $requested_datadir, $quiet) = @_;
     return($DATADIR) if (defined($DATADIR));
-    my $dir = $ENV{PWD} || Cwd::getcwd; # TBD: check this works on Windows
-    abort(qq{Current working directory does not exist: "$dir"}) unless (defined $dir);
-    dbg(qq{Checking for data dir in: "$dir"}) if (DBG);
-    while (-d $dir) {
-	dbg(qq{Checking for Morrowind home in: "$dir"}) if (DBG);
-	my $datadir = list_files($dir)->{"data files"};
-	my $mwini = list_files($dir)->{"morrowind.ini"};
-	if ($datadir and $mwini) {
-	    $MWDIR = $dir;
-	    $DATADIR = "$MWDIR/$datadir";
-	    msg(qq{DATADIR = "$DATADIR"}) if (VERBOSE);
-	    last;
+    abort("--morrowind-dir and --data-files cannot be used together")
+	if (defined($requested_mwdir) and defined($requested_datadir));
+
+    if (defined($requested_mwdir)) {
+	$MWDIR = File::Spec->rel2abs($requested_mwdir);
+	abort(qq{Morrowind directory "$requested_mwdir" does not exist})
+	    unless (-d $MWDIR);
+	my $files = list_files($MWDIR);
+	my $datadir = $files->{"data files"};
+	my $mwini = $files->{"morrowind.ini"};
+	abort(qq{"$requested_mwdir" does not contain "Data Files" and "Morrowind.ini"})
+	    unless ($datadir and $mwini and -d "$MWDIR/$datadir" and -f "$MWDIR/$mwini");
+	$DATADIR = "$MWDIR/$datadir";
+    } elsif (defined($requested_datadir)) {
+	$DATADIR = File::Spec->rel2abs($requested_datadir);
+	abort(qq{Data Files directory "$requested_datadir" does not exist})
+	    unless (-d $DATADIR);
+	$MWDIR = File::Basename::dirname($DATADIR);
+    } elsif (!$quiet) {
+	my $dir = Cwd::getcwd();
+	abort("Current working directory does not exist") unless (defined $dir);
+	dbg(qq{Checking for data dir in: "$dir"}) if (DBG);
+	while (-d $dir) {
+	    dbg(qq{Checking for Morrowind home in: "$dir"}) if (DBG);
+	    my $files = list_files($dir);
+	    my $datadir = $files->{"data files"};
+	    my $mwini = $files->{"morrowind.ini"};
+	    if ($datadir and $mwini) {
+		$MWDIR = $dir;
+		$DATADIR = "$MWDIR/$datadir";
+		last;
+	    }
+	    my $parent = File::Basename::dirname($dir);
+	    last if ($parent eq $dir);
+	    $dir = $parent;
+	    dbg(qq{Checking for "Data Files" in: "$dir"}) if (DBG);
 	}
-	my @parts = split(m![\\/]!, $dir);
-	pop(@parts);
-	$dir = join("/", @parts);
-	dbg(qq{Checking for "Data Files" in: "$dir"}) if (DBG);
     }
+
     if (defined $MWDIR) {
 	$TES3CMD_DIR = "$MWDIR/tes3cmd";
 	$CACHE_DIR = "$MWDIR/tes3cmd/cache";
-	unless (-d $CACHE_DIR) {
-	    Util::mkpath($CACHE_DIR, 0755) or
-		  abort(qq{Unable to make directory: "$CACHE_DIR" ($!)});
-	}
-	# TBD: remove this post release of v0.40!!!
-	my $oldcachefiles = list_files($TES3CMD_DIR);
-	foreach my $oldcache (keys %$oldcachefiles) {
-	    if ($oldcache =~ /\.cache$/ and
-		-f "$TES3CMD_DIR/$oldcache") {
-		msg(qq{[Note: Removing obsolete cache file: "$TES3CMD_DIR/$oldcache"]});
-		unlink("$TES3CMD_DIR/$oldcache");
-	    }
-	}
+	msg(qq{DATADIR = "$DATADIR"}) if (VERBOSE);
     } else {
-	msg(qq{WARNING: Can't find "Data Files" directory, functionality reduced. You should first cd (change directory) to somewhere under where Morrowind is installed.});
+	msg(qq{WARNING: Can't find "Data Files" directory, functionality reduced. Use --morrowind-dir or --data-files, or first cd to somewhere under the Morrowind installation.}) unless ($quiet);
 	$MWDIR = '.';
 	$DATADIR = '.';		# not running under morrowind directory
 	$TES3CMD_DIR = '.';
@@ -327,14 +347,7 @@ sub find_morrowind {
 	$opt_no_cache = 1;	# don't know where MW stuff is, turn off caching
     }
     prn qq{<DATADIR> is "$DATADIR"} if (VERBOSE);
-    unless (-d $TES3CMD_DIR) {
-	if (-e $TES3CMD_DIR) {
-	    abort(qq{"$TES3CMD_DIR" exists, but is not a directory, please remove or rename it.});
-	}
-	mkdir($TES3CMD_DIR, 0755) or
-	    abort(qq{Unable to make directory: "$TES3CMD_DIR" ($!)});
-    }
-    if (-d "$DATADIR/tes3cmd") {
+    if (!$quiet and -d "$DATADIR/tes3cmd") {
 	msg(qq{[Found old version of tes3cmd directory: $DATADIR/tes3cmd]});
 	msg(qq{[This old version can be safely removed. New version is now one level up.]});
     }
@@ -4827,6 +4840,20 @@ GENERAL HELP:
 OPTIONS given to commands may be abbreviated, as long as the abbreviations are
 unique.
 
+GLOBAL OPTIONS:
+
+  --data-files <dir>
+    use <dir> as the Data Files directory
+
+  --help, -h
+    show help for the selected command
+
+  --morrowind-dir <dir>
+    use the Morrowind installation in <dir>
+
+  --version, -V
+    show the tes3cmd version
+
 Commands mostly for Morrowind Players: "clean", "header --synchronize". and
 "multipatch" (also see: the "fixit" command which rolls these together).
 
@@ -5679,17 +5706,7 @@ tes3cmd header --synchronize "my plugin.esp"
 
      help =>
      { preprocess => sub {
-	   my $cmd_name = shift(@ARGV);
-	   if (defined($cmd_name) and
-	       defined(my $cmd_ref = $COMMAND{$cmd_name})) {
-	       die($cmd_ref->{usage}."\n");
-	   } else {
-	       die(join("",
-			$Usage1,
-			(map { (/^(help|-)/ or (not defined $COMMAND{$_}->{description})) ? "" :
-				  "  $_\n    $COMMAND{$_}->{description}.\n" } (sort keys %COMMAND)),
-			$Usage2));
-	   }
+	   print_help(shift(@ARGV));
        },
      },
 
@@ -7156,6 +7173,10 @@ sub load_master_cache {
 sub save_master_cache {
     my($esm) = @_;
     return(0) if ($opt_no_cache);
+    unless (-d $CACHE_DIR) {
+	Util::mkpath($CACHE_DIR, 0755) or
+	    abort(qq{Unable to make directory: "$CACHE_DIR" ($!)});
+    }
     my $size = (-s $T3->datapath($esm));
     dbg("save_master_cache($esm) saving size: $size") if (DBG);
     store([ $size, $MASTER_ID->{$esm}], master_cache_path($esm));
@@ -7213,7 +7234,7 @@ sub load_mergeable_objects {
     }
     # Invalidate entire cache when codec changes
     if (defined($cachedata->{_codec_version_}) and $cachedata->{_codec_version_} ne $TES3::Record::CODEC_VERSION) {
-	err("Invalidating Mergeable Object Cache due to CODEC update.");
+	msg("Invalidating Mergeable Object Cache due to CODEC update.");
 	$cachedata = {_codec_version_ => $TES3::Record::CODEC_VERSION };
     }
     my @load_order = $T3->load_order;
@@ -7291,7 +7312,7 @@ sub load_leveled_lists {
     }
     # Invalidate entire cache when codec changes
     if (defined($cachedata->{_codec_version_}) and $cachedata->{_codec_version_} ne $TES3::Record::CODEC_VERSION) {
-	err("Invalidating Leveled List Cache due to CODEC update.");
+	msg("Invalidating Leveled List Cache due to CODEC update.");
 	$cachedata = {_codec_version_ => $TES3::Record::CODEC_VERSION };
     }
     my @load_order = $T3->load_order;
@@ -9012,10 +9033,10 @@ sub esp_esm_convert {
 	close(OUT);
     };
     if ($@) {
-	err($@);
+	my $error = $@;
 	close(OUT);
 	unlink($output);
-	return;
+	die($error);
     }
     my($atime, $mtime) = (stat($input))[8,9];
     utime($atime, $mtime, $output);
@@ -9616,12 +9637,45 @@ tes3cmd help
 EOF
 }
 
+sub print_help {
+    my($cmd_name) = @_;
+    if (defined($cmd_name)) {
+	my $cmd_ref = $COMMAND{$cmd_name};
+	abort(qq{Unknown command "$cmd_name"}) unless (defined($cmd_ref));
+	print($cmd_ref->{usage}."\n");
+    } else {
+	print(join("",
+	    $Usage1,
+	    (map { (/^(help|-)/ or (not defined $COMMAND{$_}->{description})) ? "" :
+		"  $_\n    $COMMAND{$_}->{description}.\n" } (sort keys %COMMAND)),
+	    $Usage2));
+    }
+}
+
+sub print_version {
+    print "tes3cmd $::VERSION\n";
+}
+
 sub tes3cmd_main {
-    TES3::Util::find_morrowind();
-    msg("ASSERTIONS ON!") if (ASSERT);
-    my $cmd_name = (not defined($ARGV[0]) or $ARGV[0] =~ /^--/) ? '' : shift(@ARGV);
-    $COMMAND{help}->{preprocess}()
-	if ((not defined($cmd_name)) or ($cmd_name =~ /help/i));
+    if (defined($ARGV[0]) and $ARGV[0] =~ /^(?:--help|-help|-h)$/) {
+	shift(@ARGV);
+	print_help();
+	return(0);
+    }
+    if (defined($ARGV[0]) and $ARGV[0] =~ /^(?:--version|-V)$/) {
+	shift(@ARGV);
+	print_version();
+	return(0);
+    }
+
+    my $cmd_name = shift(@ARGV);
+    minihelp() unless (defined($cmd_name));
+    if ($cmd_name =~ /^help$/i) {
+	my $help_command = shift(@ARGV);
+	abort("help accepts at most one command") if (@ARGV);
+	print_help($help_command);
+	return(0);
+    }
     my $cmd_ref = $COMMAND{$cmd_name};
     if (not $cmd_ref) {
 	# check to see if user extension
@@ -9636,6 +9690,20 @@ sub tes3cmd_main {
     minihelp()
 	unless ($cmd_ref);
     GetOptions(@{$cmd_ref->{options}}) or die($cmd_ref->{usage}."\n");
+    if ($opt_help) {
+	print_help($cmd_name);
+	return(0);
+    }
+    if ($opt_version) {
+	print_version();
+	return(0);
+    }
+    TES3::Util::find_morrowind(
+	$opt_morrowind_dir,
+	$opt_data_files,
+	(($cmd_name eq 'dump' and not $opt_active) or $cmd_name eq 'diff'),
+    );
+    msg("ASSERTIONS ON!") if (ASSERT);
     # glob plugin names containing glob chars and remove ignored plugins
     my @plugins;
     my %ignored_plugin = map { lc($_), 1 } (@opt_ignore_plugin);
@@ -9650,17 +9718,30 @@ sub tes3cmd_main {
 	my @load_order = $T3->load_order;;
 	if (@plugins) {
 	    # only process specified plugins if they are active
-	    my %lo = map {lc,1} @load_order;
+	    my %lo = map {lc($_),$_} @load_order;
 	    my @active;
 	    foreach my $plug (@plugins) {
-		push(@active, $plug) if ($lo{lc($plug)});
+		my $name = File::Basename::basename($plug);
+		if (defined(my $active_name = $lo{lc($name)})) {
+		    push(@active, $T3->datapath($active_name) || $active_name);
+		}
 	    }
 	    # sort input plugins by modification date
 	    @plugins = sort { (-M $b) <=> (-M $a) } @active;
 	} else {
 	    # process all active plugins
-	    @plugins = @load_order;
+	    @plugins = map { $T3->datapath($_) || $_ } @load_order;
 	}
+    }
+    unless ($cmd_name eq 'active') {
+	@plugins = map {
+	    my $plugin = $_;
+	    if (not -e $plugin and $plugin =~ /\.es[mps]$/i) {
+		my $data_path = $T3->datapath($plugin);
+		$plugin = $data_path if (defined($data_path));
+	    }
+	    $plugin;
+	} @plugins;
     }
     # when there's only one plugin, we don't need to print banners
     $opt_no_banner = 1 if (scalar(@plugins) == 1);
