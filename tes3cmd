@@ -395,54 +395,147 @@ sub read_gamefiles {
     my($self) = @_;
     my $mwini = $self->ini_file;
     my @gamefiles = ();
-    open(INI, "<", $mwini) or abort(qq{opening "$mwini" for input ($!)});
-    binmode(INI, ':crlf');
+    open(my $ini, '<', $mwini) or abort(qq{opening "$mwini" for input ($!)});
+    binmode($ini, ':raw') or abort(qq{setting binmode on "$mwini" ($!)});
     dbg(qq{Opened "$mwini" for Input\n}) if (DBG);
-    while (<INI>) {
-	last if (/^\[Game Files\]/i);
+    my $contents = '';
+    while (1) {
+	my $nread = read($ini, my $buffer, 65536);
+	abort(qq{reading "$mwini" ($!)}) unless defined $nread;
+	last unless $nread;
+	$contents .= $buffer;
     }
-    while (<INI>) {
-	chomp;
-	if (/^GameFile\d+=(.+)/) {
+    close($ini) or abort(qq{closing "$mwini" ($!)});
+    my @lines = split(/\r\n|\n/, $contents);
+    while (@lines) {
+	last if shift(@lines) =~ /^\[Game Files\]/i;
+    }
+    foreach my $line (@lines) {
+	if ($line =~ /^GameFile\d+=(.+)/) {
 	    push(@gamefiles, $1);
-	} elsif (/^\[.+\]/) {
+	} elsif ($line =~ /^\[.+\]/) {
 	    last;
 	}
     }
-    close(INI);
     return(\@gamefiles);
 }
 
 sub write_gamefiles {
     my($self, $gamefiles) = @_;
     my $mwini = $self->ini_file;
-    my $tmpini = qq{${mwini}.tmp};
-    open(INI, "<", $mwini) or abort(qq{opening "$mwini" for input ($!)});
-    binmode(INI, ':crlf');
-    open(TMP, ">", "$tmpini") or abort(qq{opening "$tmpini" for output ($!)});
-    binmode(TMP, ':crlf');
-    while (<INI>) {		# just copy ini file up to [Game Files] section
-	print TMP;
-	last if (/^\[Game Files\]/i);
+    open(my $inp, '<', $mwini) or abort(qq{opening "$mwini" for input ($!)});
+    binmode($inp, ':raw') or abort(qq{setting binmode on "$mwini" ($!)});
+    my $contents = '';
+    while (1) {
+	my $nread = read($inp, my $buffer, 65536);
+	abort(qq{reading "$mwini" ($!)}) unless defined $nread;
+	last unless $nread;
+	$contents .= $buffer;
     }
-    my $i=0;
-    foreach my $gamefile (@$gamefiles) { # write new gamefiles section
-	print TMP "GameFile$i=$gamefile\n";
-	$i++;
-    }
-    while (<INI>) {		# skip old gamefiles section
-	if (/^\[.*\]/i) {
-	    print TMP;
+    close($inp) or abort(qq{closing "$mwini" ($!)});
+
+    my @lines = split(/(?<=\n)/, $contents);
+    my $header_index;
+    foreach my $index (0 .. $#lines) {
+	my $line = $lines[$index];
+	$line =~ s/(?:\r\n|\n)$//;
+	if ($line =~ /^\[Game Files\]/i) {
+	    $header_index = $index;
 	    last;
 	}
     }
-    while (<INI>) {		# copy anything after gamefiles section
-	print TMP $_;
+    abort(qq{Unable to find [Game Files] section in "$mwini"})
+	unless defined $header_index;
+
+    my $section_end = scalar(@lines);
+    foreach my $index (($header_index + 1) .. $#lines) {
+	my $line = $lines[$index];
+	$line =~ s/(?:\r\n|\n)$//;
+	if ($line =~ /^\[.*\]/) {
+	    $section_end = $index;
+	    last;
+	}
     }
-    close(INI);
-    close(TMP);
-    rename($mwini, "$mwini.old") or abort(qq{Error renaming "$mwini" to "$mwini.old" ($!)});
-    rename($tmpini, $mwini) or abort(qq{Error renaming "$tmpini" to "$mwini" ($!)});
+
+    my $eol;
+    foreach my $index (($header_index + 1) .. ($section_end - 1)) {
+	if ($lines[$index] =~ /^GameFile\d+=/ and $lines[$index] =~ /(\r\n|\n)$/) {
+	    $eol = $1;
+	    last;
+	}
+    }
+    $eol ||= (($lines[$header_index] =~ /(\r\n|\n)$/) ? $1 : undef);
+    $eol ||= (($contents =~ /(\r\n|\n)/) ? $1 : "\r\n");
+
+    my @new_entries;
+    foreach my $index (0 .. $#{$gamefiles}) {
+	push(@new_entries, "GameFile$index=$gamefiles->[$index]$eol");
+    }
+
+    my @new_lines = @lines[0 .. $header_index];
+    if (@new_entries and $new_lines[-1] !~ /\n$/) {
+	$new_lines[-1] .= $eol;
+    }
+    my $inserted;
+    foreach my $index (($header_index + 1) .. ($section_end - 1)) {
+	if ($lines[$index] =~ /^GameFile\d+=/) {
+	    unless ($inserted) {
+		push(@new_lines, @new_entries);
+		$inserted = 1;
+	    }
+	} else {
+	    push(@new_lines, $lines[$index]);
+	}
+    }
+    push(@new_lines, @new_entries) unless $inserted;
+    push(@new_lines, @lines[$section_end .. $#lines]) if $section_end <= $#lines;
+    my $new_contents = join('', @new_lines);
+    return(0) if $new_contents eq $contents;
+
+    my($file, $dir) = File::Basename::fileparse($mwini);
+    my($out, $tmpini) = File::Temp::tempfile("$file.tmp.XXXXXX", DIR => $dir, UNLINK => 0);
+    my $ok = eval {
+	binmode($out, ':raw') or abort(qq{setting binmode on "$tmpini" ($!)});
+	abort('writing temporary Morrowind.ini (injected failure)')
+	    if $ENV{HARNESS_ACTIVE} && $ENV{TES3CMD_TEST_FAIL_INI_WRITE};
+	print {$out} $new_contents
+	    or abort(qq{writing temporary Morrowind.ini "$tmpini" ($!)});
+	close($out) or abort(qq{closing temporary Morrowind.ini "$tmpini" ($!)});
+	undef $out;
+
+	open(my $check, '<', $tmpini)
+	    or abort(qq{opening temporary Morrowind.ini "$tmpini" for validation ($!)});
+	binmode($check, ':raw') or abort(qq{setting binmode on "$tmpini" ($!)});
+	local $/;
+	my $written = <$check>;
+	close($check) or abort(qq{closing validated Morrowind.ini "$tmpini" ($!)});
+	abort(qq{validating temporary Morrowind.ini "$tmpini"})
+	    unless defined($written) and $written eq $new_contents;
+
+	my @ini_stat = stat($mwini);
+	abort(qq{reading metadata for "$mwini" ($!)}) unless @ini_stat;
+	my($mode, $atime, $mtime) = ($ini_stat[2] & 07777, @ini_stat[8,9]);
+	chmod($mode, $tmpini)
+	    or abort(qq{setting permissions on "$tmpini" ($!)});
+	my $backup = "$mwini.old";
+	File::Copy::copy($mwini, $backup)
+	    or abort(qq{backing up "$mwini" to "$backup" ($!)});
+	chmod($mode, $backup)
+	    or abort(qq{setting permissions on "$backup" ($!)});
+	utime($atime, $mtime, $backup)
+	    or abort(qq{setting timestamps on "$backup" ($!)});
+	main::install_replacement($tmpini, $mwini, $backup);
+	utime($atime, $mtime, $mwini)
+	    or abort(qq{setting timestamps on "$mwini" ($!)});
+	1;
+    };
+    unless ($ok) {
+	my $error = $@;
+	close($out) if defined($out) and defined(fileno($out));
+	unlink($tmpini) if -f $tmpini;
+	die($error);
+    }
+    return(1);
 }
 
 sub load_order {
@@ -9416,12 +9509,14 @@ sub cmd_active {
     if ($opt_active_on or $opt_active_off) {
 	my $gamefiles = $T3->read_gamefiles();
 	my %gfiles = ();
+	my $modified = 0;
 	$gfiles{lc $_} = $_ foreach (@$gamefiles);
 	if ($opt_active_on) {	# Activating given plugins
 	    foreach my $plug (@plugins) {
 		unless ($gfiles{lc $plug}) {
 		    prn("ACTIVATED: $plug");
 		    $gfiles{lc $plug} = $plug;
+		    $modified = 1;
 		}
 	    }
 	} elsif ($opt_active_off) {	# De-Activating given plugins
@@ -9429,11 +9524,12 @@ sub cmd_active {
 		if ($gfiles{lc $plug}) {
 		    prn("DEACTIVATED: $plug");
 		    delete $gfiles{lc $plug};
+		    $modified = 1;
 		}
 	    }
 	}
 	my @newgamefiles = sort values %gfiles;
-	$T3->write_gamefiles(\@newgamefiles);
+	$T3->write_gamefiles(\@newgamefiles) if $modified;
     } else {
 	print "[LOAD ORDER]\n";
 	my $n = 0;
