@@ -36,6 +36,8 @@ use strict;
 use warnings;
 
 my $R;				# current record for modify command
+my $MODIFY_USER_SOURCE;
+my $MODIFY_USER_SUB;
 
 our $CURRENT_PLUGIN = '';
 our $MWDIR;			# Where Morrowind is installed
@@ -151,8 +153,6 @@ our $opt_modify_program_file = '';
 our $opt_modify_replace = '';
 our $opt_modify_replacefirst = '';
 our $opt_modify_run = '';
-
-our $opt_run_program_file = '';
 
 our $opt_multipatch_cellnames;
 our $opt_multipatch_fogbug;
@@ -4803,21 +4803,48 @@ my @lint_bethesda_doors =
 #	    abort("Error processing $program_file ($@)") if ($@);
 #	}
 sub load_perl {
-    my($program_file) = (@_);
+    my($program_file, $kind) = (@_);
+    $kind ||= 'extension';
     if ($program_file) {
 	dbg("loading program-file: $program_file") if (DBG);
 	my $prog;
-	if (open(PROG, "<", $program_file)) {
+	if (open(my $program, "<", $program_file)) {
 	    local $/ = undef;
-	    $prog = join("", <PROG>);
-	    close(PROG);
+	    $prog = join("", <$program>);
+	    close($program) or abort(qq{Error closing trusted Perl $kind "$program_file" ($!)});
 	} else {
-	    abort(qq{Error opening "$program_file" ($!)});
+	    abort(qq{Error opening trusted Perl $kind "$program_file" ($!)});
 	}
 	my $value = eval($prog);
-	abort("Error processing $program_file ($@)") if ($@);
+	abort(qq{Error loading trusted Perl $kind "$program_file": $@}) if ($@);
 	return($value);
     }
+}
+
+sub validate_command_extension {
+    my($program_file, $command) = @_;
+    abort(qq{Command extension "$program_file" must return a command definition hash})
+	unless (ref($command) eq 'HASH');
+    abort(qq{Command extension "$program_file" must define an options array})
+	unless (ref($command->{options}) eq 'ARRAY');
+    abort(qq{Command extension "$program_file" must define usage text})
+	unless (defined($command->{usage}));
+    my @callbacks = grep { defined($command->{$_}) } qw(preprocess process postprocess);
+    abort(qq{Command extension "$program_file" must define a command callback})
+	unless (@callbacks);
+    foreach my $callback (@callbacks) {
+	abort(qq{Command extension "$program_file" has an invalid $callback callback})
+	    unless (ref($command->{$callback}) eq 'CODE');
+    }
+    return($command);
+}
+
+sub execute_command_callback {
+    my($program_file, $phase, $callback, @arguments) = @_;
+    return($callback->(@arguments)) unless (defined($program_file));
+    my $ok = eval { $callback->(@arguments); 1; };
+    abort(qq{Command extension "$program_file" failed during $phase: $@})
+	unless ($ok);
 }
 
 my $Usage1 = qq{Usage: tes3cmd COMMAND OPTIONS plugin...
@@ -4853,6 +4880,12 @@ GLOBAL OPTIONS:
 
   --version, -V
     show the tes3cmd version
+
+TRUSTED PERL EXTENSIONS:
+
+The modify command's --run and --program-file options execute trusted Perl
+inside tes3cmd with full process access. Filename-based command extensions are
+deprecated and may be removed in a future release.
 
 Commands mostly for Morrowind Players: "clean", "header --synchronize". and
 "multipatch" (also see: the "fixit" command which rolls these together).
@@ -6015,9 +6048,30 @@ more detail about the flagged items.
 		  'type=s@'],
 
       preprocess => sub {
-	  # load Perl program if specified with --program-file
-	  load_perl($opt_modify_program_file);
-	  $opt_modify_run = 'main($R);' unless ($opt_modify_run);
+	  my $replace_modes = grep { $_ } ($opt_modify_replace, $opt_modify_replacefirst);
+	  abort("Specify only one of --replace and --replacefirst")
+	      if ($replace_modes > 1);
+	  abort("--replace/--replacefirst cannot be combined with trusted Perl options")
+	      if ($replace_modes and ($opt_modify_program_file or $opt_modify_run));
+	  return if ($replace_modes);
+
+	  if ($opt_modify_program_file) {
+	      load_perl($opt_modify_program_file, 'modify program');
+	  }
+	  if ($opt_modify_run) {
+	      $MODIFY_USER_SOURCE = '--run';
+	  } elsif ($opt_modify_program_file) {
+	      abort(qq{Trusted Perl modify program "$opt_modify_program_file" must define main()})
+		  unless (main->can('main'));
+	      $opt_modify_run = 'main($R);';
+	      $MODIFY_USER_SOURCE = qq{modify program "$opt_modify_program_file"};
+	  } else {
+	      abort("modify requires --replace, --replacefirst, --run, or --program-file");
+	  }
+
+	  $MODIFY_USER_SUB = eval("sub { $opt_modify_run }");
+	  abort(qq{Error compiling trusted Perl from $MODIFY_USER_SOURCE: $@})
+	      if ($@ or ref($MODIFY_USER_SUB) ne 'CODE');
       },
 
       process => \&cmd_modify,
@@ -6108,6 +6162,14 @@ OPTIONS:
 This command allows you to do complex batch modifications of plugin records.
 You can really damage things with this command, so be careful!
 
+SECURITY:
+
+Code supplied through --run or --program-file is trusted Perl, not sandboxed
+data. It runs inside tes3cmd with the same access to files, processes, and the
+operating system as tes3cmd itself. Only run code you wrote or reviewed.
+Compilation and runtime failures abort the command; transactional plugin
+updates leave the original plugin unchanged.
+
 Note: documentation for regular expressions:
   http://perldoc.perl.org/perlre.html
 
@@ -6136,115 +6198,6 @@ tes3cmd modify --type cont --run '\$R->set({f=>"count"}, -3)' ale_patch.esp
 tes3cmd modify --type cont --run "\$R->dump" ale_clothing_v0.esp
 # Then only modify the last 3 items:
 tes3cmd modify --type cont --run "\$R->set({i=>[-3..-1],f=>'count'}, 4)" ale_clothing_v0.esp
-},
-     },
-
-     "-run" =>
-     {
-      description => qq{Run user code extensions},
-      options => [@STDOPT,
-		  @MODOPT,
-		  'active',
-		  'exact-id=s@',
-		  'exterior',
-		  'flag=s@',
-		  'id=s@',
-		  'ignore-plugin=s@',
-		  'interior',
-		  'match=s@',
-		  'no-match|M=s@',
-		  'program-file=s'     => \$opt_modify_program_file,
-		  'sub-match=s',
-		  'sub-no-match=s',
-		  'type=s@'],
-
-      preprocess => sub {
-	  # load Perl program if specified with --program-file
-	  load_perl($opt_run_program_file);
-      },
-
-      process => \&cmd_run,
-
-      usage => qq{Usage: tes3cmd run programfile OPTIONS plugin...
-
-Loads a tes3cmd extension "programfile" to perform custome processing of plugins.
-
-OPTIONS:
- --debug
-	turn on debug messages
-
- --active
-	only process specified plugins that are active. If none specified,
-	process all active plugins. Plugins will be processed in the same
-	order as your normal game load order.
-
- --backup-dir
-	where backup files get stored. The default is:
-	"morrowind/tes3cmd/backups"
-
- --exact-id* <id-string>
-	only modify records whose ids exactly match given <id-string>
-
- --exterior
-	only match if record is an Exterior CELL
-
- --flag* <flag>
-	only modify records with given flag. Flags may be given symbolically
-	as: (deleted, persistent, ignored, blocked), or via their numeric
-	values (i.e. persistent is 0x400).
-
- --hide-backups
-	any created backup files will get stashed in the backup directory
-	(--backup-dir)
-
- --id* <id-regex>
-	only modify records whose ids match regular expression pattern
-	<id-regex>
-
- --ignore-plugin* <plugin-name>
-        skips specified plugin if it appears on command line. plugin name is
-        matched by exact, but caseless, string comparison.
-
- --interior
-	only match if record is an Interior CELL
-
- --match* <regex>
-	only modify records that match given regular expression <regex>
-	If more than one of these switches is supplied, ALL must match
-	for a record to be processed.
-
- --no-match*|--M* <regex>
-	only modify records that do not match given regular expression
-	<regex>
-	If more than one of these switches is supplied, if ANY match,
-	that record will be skipped.
-
- --sub-match <regex>
-	only modify the subrecords that match <regex>. When this option (or
-	--sub-no-match) are used, modification only applies to matching
-	subrecords. Without either of these options modifications are
-	performed on whole records.
-
- --sub-no-match <regex> only modify the subrecords that do not match <regex>.
-	(see also --sub-match above).
-
- --type* <record-type>
-	only modify records with the given <record-type>
-
- Note: starred (*) options can be repeated, and matching of strings is not
- case-sensitive.
-
-This command allows you to do complex batch modifications of plugin records.
-You can really damage things with this command, so be careful!
-
-Note: documentation for regular expressions:
-  http://perldoc.perl.org/perlre.html
-
-Example(s):
-
-# Run your homegrown extension
-tes3cmd run myprog.pl ...
-
 },
      },
 
@@ -8921,22 +8874,18 @@ sub cmd_modify {
 				     ((not $opt_sub_no_match) or ($subrec_str !~ /$opt_sub_no_match/i)));
 		    }
 		    $R = $tr;
-		    eval($opt_modify_run);
+		    my $ok = eval { $MODIFY_USER_SUB->(); 1; };
+		    abort(qq{Trusted Perl from $MODIFY_USER_SOURCE failed for "$plugin" record $rectype "$id": $@})
+			unless ($ok);
 		    $modified = 1 if ($R->{_modified_});
-		    if ($@) {
-			msg(qq{Error running "$opt_modify_run" on: $rectype ($@)});
-			$modified = 0;
-		    }
 		}
 	    } else {
 		# run modifying code on entire subrec
 		$R = $tr;
-		eval($opt_modify_run);
+		my $ok = eval { $MODIFY_USER_SUB->(); 1; };
+		abort(qq{Trusted Perl from $MODIFY_USER_SOURCE failed for "$plugin" record $rectype "$id": $@})
+		    unless ($ok);
 		$modified = 1 if ($R->{_modified_});
-		if ($@) {
-		    msg(qq{Error running "$opt_modify_run" on: $rectype ($@)});
-		    $modified = 0;
-		}
 	    }
 	}
 	if ($modified) {
@@ -8949,41 +8898,6 @@ sub cmd_modify {
     };
     process_plugin_for_update($plugin, $fun) or return(0);
 } # cmd_modify
-
-sub cmd_run {
-    my($plugin, $userfun) = @_;
-    dbg("cmd_run($plugin)") if (DBG);
-    $userfun = \&main unless($userfun); # function that processes each record
-    my $subrecords = ($opt_sub_match or $opt_sub_no_match);
-    my $fun = sub {
-	my($rec_match, $rectype, $tr, $print_rec) = rec_match($plugin, @_); # calls tr->decode()
-	# we pass through all records that did not match the standard record selection switches of rec_match
-	return unless ($rec_match);
-	my $id = $tr->id;
-	if ($subrecords) {
-	    # run code only on matching subrecs
-	    foreach my $tsr ($tr->subrecs()) {
-		if ($subrecords) {
-		    my $subrec_str = $tsr->tostr;
-		    next unless (((not $opt_sub_match) or ($subrec_str =~ /$opt_sub_match/i)) and
-				 ((not $opt_sub_no_match) or ($subrec_str !~ /$opt_sub_no_match/i)));
-		}
-		$userfun->($tr);	# user supplied the "main" subroutine
-		if ($@) {
-		    msg(qq{Error running "main()" on: $rectype ($@)});
-		}
-	    }
-	} else {
-	    # run modifying code on entire subrec
-	    $userfun->($tr);	# user supplied the "main" subroutine
-	    if ($@) {
-		msg(qq{Error running "main()" on: $rectype ($@)});
-	    }
-	}
-	return;
-    };
-    process_plugin_for_input($plugin, $fun) or return(0);
-} # cmd_run
 
 sub cmd_header {
     my($plugin) = @_;
@@ -9676,14 +9590,23 @@ sub tes3cmd_main {
 	print_help($help_command);
 	return(0);
     }
+    abort("The hidden -run command has been removed; use modify --program-file instead")
+	if ($cmd_name eq '-run');
     my $cmd_ref = $COMMAND{$cmd_name};
+    my $extension_file;
     if (not $cmd_ref) {
 	# check to see if user extension
-	my $extension;
 	if (-f $cmd_name) {
-	    $cmd_ref = load_perl($cmd_name);
+	    $extension_file = $cmd_name;
 	} elsif (-f "${cmd_name}.pl") {
-	    $cmd_ref = load_perl("${cmd_name}.pl");
+	    $extension_file = "${cmd_name}.pl";
+	}
+	if (defined($extension_file)) {
+	    msg(qq{WARNING: Filename-based command extensions are deprecated and may be removed in a future release. "$extension_file" is trusted Perl with full process access.});
+	    $cmd_ref = validate_command_extension(
+		$extension_file,
+		load_perl($extension_file, 'command extension'),
+	    );
 	}
     }
     dbg(qq{Command Selected: "$cmd_name"}) if (DBG);
@@ -9691,7 +9614,11 @@ sub tes3cmd_main {
 	unless ($cmd_ref);
     GetOptions(@{$cmd_ref->{options}}) or die($cmd_ref->{usage}."\n");
     if ($opt_help) {
-	print_help($cmd_name);
+	if (defined($extension_file)) {
+	    print($cmd_ref->{usage}."\n");
+	} else {
+	    print_help($cmd_name);
+	}
 	return(0);
     }
     if ($opt_version) {
@@ -9754,7 +9681,7 @@ sub tes3cmd_main {
     if (defined(my $pre = $cmd_ref->{preprocess})) {
 	# run the pre-process function
 	dbg("$cmd_name: Executing Pre-Process function") if (DBG);
-	$pre->(@plugins);
+	execute_command_callback($extension_file, 'preprocess', $pre, @plugins);
     }
     if (defined(my $process = $cmd_ref->{process})) {
 	# process individual plugins
@@ -9766,13 +9693,13 @@ sub tes3cmd_main {
 	    $CURRENT_PLUGIN = $plugin;
 	    $CURRENT_DIAL = undef; # reset
 	    #$FACT_I = 0;	  # reset
-	    $process->($plugin);
+	    execute_command_callback($extension_file, 'process', $process, $plugin);
 	}
     }
     if (defined(my $post = $cmd_ref->{postprocess})) {
 	# run the post-process function
 	dbg("$cmd_name: Executing Post-Process function") if (DBG);
-	$post->(@plugins);
+	execute_command_callback($extension_file, 'postprocess', $post, @plugins);
     }
 } # tes3cmd_main
 
