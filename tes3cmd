@@ -22,7 +22,7 @@ BEGIN {
 
 use Carp;
 use IO::Handle;
-use Fcntl qw(SEEK_SET SEEK_CUR SEEK_END);
+use Fcntl qw(SEEK_SET SEEK_CUR SEEK_END O_WRONLY O_CREAT O_EXCL O_TRUNC);
 use File::Basename;
 use File::Spec;
 use File::Copy;
@@ -44,7 +44,7 @@ our $TES3CMD_DIR;		# tes3cmd directory ($MWDIR/tes3cmd)
 our $CACHE_DIR;			# cache directory ($MWDIR/tes3cmd/cache)
 
 ### MAIN COMMON COMMAND OPTIONS
-our @STDOPT = ("assert", "debug", "output=s", "verbose"); # options for all commands
+our @STDOPT = ("assert", "debug", "verbose"); # options for all commands
 our @MODOPT = ("backup-dir=s", "hide-backups"); # options for commands that modify
 our $opt_active;				# limit processing to active plugins
 our $opt_output;				# specify output (default is STDOUT)
@@ -3972,7 +3972,7 @@ my $T3 = new TES3::Util;
 my $MASTER_ID;			# data loaded from masters
 my $GLOBCHARS = '*?';		# for filename globbing on Windows
 my $RECTYPE_LEN = 4;
-my $DUMP_RAWOUT;
+my $DUMP_OUTPUT;
 
 # plugins which are never cleaned
 # name -> reason for not cleaning
@@ -5249,13 +5249,13 @@ tes3cmd diff --not-equal "my plugin1.esp" plugin2.esp
      { description => qq{Dump records as text for easy study},
        options => [@STDOPT,
 		   'active',
-		   'binary',
+		   'binary'                   => \$opt_dump_binary,
 		   'exact-id=s@',
 		   'exterior',
 		   'flag=s@',
 		   'format=s@'		  => \@opt_dump_format,
 		   'no-quote'		  => \$opt_dump_no_quote,
-		   'header',
+		   'header'                   => \$opt_dump_header,
 		   'id=s@',
 		   'ignore-plugin=s@',
 		   'instance-match=s',
@@ -5265,12 +5265,15 @@ tes3cmd diff --not-equal "my plugin1.esp" plugin2.esp
 		   'match=s@',
 		   'no-banner|B',
 		   'no-match|M=s@',
-		   'wrap',
+		   'output=s'                 => \$opt_output,
+		   'overwrite'                => \$opt_overwrite,
+		   'wrap'                     => \$opt_dump_wrap,
 		   'raw-with-header=s'   => \$opt_dump_raw_with_header,
 		   'raw=s'               => \$opt_dump_raw,
 		   'separator=s',
 		   'type=s@'],
        preprocess =>  sub {
+	   my(@plugins) = @_;
 
 	   # translate the obsolete command switches
 	   if ($opt_dump_raw_with_header) {
@@ -5286,20 +5289,38 @@ tes3cmd diff --not-equal "my plugin1.esp" plugin2.esp
 	   }
 	   abort("did you forget to give a filename for raw output?")
 	       if (defined($opt_dump_raw) and $opt_dump_raw =~ /^-/);
+	   abort("--binary requires --output <filename>")
+	       if ($opt_dump_binary and not defined($opt_output));
+	   abort("--header requires --binary")
+	       if ($opt_dump_header and not $opt_dump_binary);
+	   abort("--overwrite requires --output <filename>")
+	       if ($opt_overwrite and not defined($opt_output));
 
-	   # write out the header here as we would like to be able to append to it from multiple input plugins
-	   if ($opt_dump_binary) {
-	       if ($opt_dump_header) {
-		   $DUMP_RAWOUT = open_for_output($opt_output);
-		   print $DUMP_RAWOUT make_header();
+	   if (defined($opt_output)) {
+	       my $output_path = (-e $opt_output)
+		   ? Cwd::abs_path($opt_output)
+		   : File::Spec->rel2abs($opt_output);
+	       my @output_stat = stat($opt_output);
+	       foreach my $plugin (@plugins) {
+		   my $plugin_path = (-e $plugin)
+		       ? Cwd::abs_path($plugin)
+		       : File::Spec->rel2abs($plugin);
+		   abort(qq{Output destination "$opt_output" is also an input plugin})
+		       if ($output_path eq $plugin_path or
+			   (@output_stat and do {
+			       my @plugin_stat = stat($plugin);
+			       @plugin_stat and
+				   $output_stat[0] == $plugin_stat[0] and
+				   $output_stat[1] == $plugin_stat[1];
+			   }));
+	       }
+	       $DUMP_OUTPUT = open_dump_output($opt_output, $opt_overwrite);
+	       if ($opt_dump_binary) {
+		   binmode($DUMP_OUTPUT, ':raw')
+		       or abort(qq{setting binmode on "$opt_output" ($!)});
+		   print $DUMP_OUTPUT make_header() if ($opt_dump_header);
 	       } else {
-		   if (-f $opt_output) {
-		       msg(qq{Appending to: "$opt_output"});
-		       $DUMP_RAWOUT = open_for_append($opt_output);
-		   } else {
-		       msg(qq{Creating: "$opt_output"});
-		       $DUMP_RAWOUT = open_for_output($opt_output);
-		   }
+		   select($DUMP_OUTPUT);
 	       }
 	   }
        },
@@ -5307,12 +5328,15 @@ tes3cmd diff --not-equal "my plugin1.esp" plugin2.esp
        process => \&cmd_dump,
        postprocess => sub {
 	   if ($opt_dump_binary) {
-	       close($DUMP_RAWOUT);
+	       close_checked($DUMP_OUTPUT, qq{dump output "$opt_output"});
 	       if ($opt_dump_header) {
 		   $opt_header_update_record_count = 1;
 		   update_header($opt_output, [qw(QUIET NOBACKUP)]);
 	       }
-	       print "\nRaw records saved in $opt_output\n";
+	       msg(qq{Raw records saved in "$opt_output"});
+	   } elsif (defined($DUMP_OUTPUT)) {
+	       select(STDOUT);
+	       close_checked($DUMP_OUTPUT, qq{dump output "$opt_output"});
 	   }
        },
        usage => qq{Usage: tes3cmd dump OPTIONS plugin...
@@ -5392,13 +5416,15 @@ OPTIONS:
  --output <filename>
 	Specify the name of the output file where records are dumped.
 
+ --overwrite
+	overwrite the output file if it already exists
+
  --wrap
 	Wrap some long fields for more nicely formatted output.
 
  --raw <file>
 	[Obsolete: use --binary --output <file>]
-	dump raw records to <file>, instead of as text. If <file> exists, records
-	are appended to the end.
+	dump raw records to <file>, instead of as text
 
  --raw-with-header <file>
 	[Obsolete: use --binary --header --output <file>]
@@ -5417,10 +5443,12 @@ OPTIONS:
 
 DESCRIPTION:
 
-Dumps the plugin to stdout in text form for easy perusal or in raw form for
-extracting a subset of records to create a new plugin. For large plugins, the
-text output can be voluminous. In the text output, a starred subrecord
-indicates it is related to following subrecords.
+Dumps the plugin to stdout in text form for easy perusal, to the file named by
+--output, or in raw form for extracting a subset of records to create a new
+plugin. Raw output requires --output. Existing output files are preserved
+unless --overwrite is specified. For large plugins, the text output can be
+voluminous. In the text output, a starred subrecord indicates it is related to
+following subrecords.
 
 Note: documentation for regular expressions:
   http://perldoc.perl.org/perlre.html
@@ -6842,6 +6870,17 @@ sub open_for_output {
     my $fh = IO::Handle->new;
     open($fh, ">", $plugin) or abort(qq{opening "$plugin" for output ($!)});
     binmode($fh, ':raw') or abort(qq{setting binmode on "$plugin" ($!)});
+    return($fh);
+}
+
+sub open_dump_output {
+    my($path, $overwrite) = @_;
+    abort(qq{Output destination "$path" already exists (use --overwrite to overwrite)})
+	if (-e $path and not $overwrite);
+    my $flags = O_WRONLY | O_CREAT | ($overwrite ? O_TRUNC : O_EXCL);
+    my $fh = IO::Handle->new;
+    sysopen($fh, $path, $flags)
+	or abort(qq{opening "$path" for output ($!)});
     return($fh);
 }
 
@@ -9259,7 +9298,7 @@ sub cmd_clean {
 sub cmd_dump {
     my($plugin) = @_;
     dbg("cmd_dump($plugin)") if (DBG);
-    my $dump_banner = ($opt_no_banner) ? "" : "\nPlugin: $plugin\n";
+    my $dump_banner = ($opt_no_banner or $opt_dump_binary) ? "" : "\nPlugin: $plugin\n";
     my $match_instances = ($opt_instance_match or $opt_instance_no_match);
     my @format_lines;
     foreach (@opt_dump_format) {
@@ -9339,16 +9378,14 @@ sub cmd_dump {
 		$nam0_tsr->{reference_count} = $n;	# update NAM0
 		my $newtr = CELL->new([@newcell]);
 		if ($opt_dump_binary) {
-		    $list_record->("Raw Output:");
-		    $newtr->write_rec($DUMP_RAWOUT);
+		    $newtr->write_rec($DUMP_OUTPUT);
 		} else {
 		    print $newtr->tostr."\n";
 		}
 	    }
 	} else {
 	    if ($opt_dump_binary) {
-		$list_record->("Raw Output:");
-		$tr->write_rec($DUMP_RAWOUT);
+		$tr->write_rec($DUMP_OUTPUT);
 	    } else {
 		$print_rec ||= $tr->tostr;
 		print "\n$print_rec\n" if ($print_rec);
