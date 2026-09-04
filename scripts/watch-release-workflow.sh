@@ -4,11 +4,13 @@
 set -euo pipefail
 
 commit="${1:?Usage: watch-release-workflow.sh COMMIT}"
+repo="${TES3CMD_GITHUB_REPOSITORY:-danneu/tes3cmd}"
 run_id=""
 
 echo "Waiting for release workflow..."
 for ((attempt = 1; attempt <= 30; attempt++)); do
     run_id="$(gh run list \
+        --repo "$repo" \
         --workflow release-stable.yml \
         --commit "$commit" \
         --limit 1 \
@@ -23,4 +25,4 @@ if [[ -z "$run_id" ]]; then
     exit 1
 fi
 
-exec gh run watch "$run_id" --exit-status
+exec gh run watch "$run_id" --repo "$repo" --exit-status
