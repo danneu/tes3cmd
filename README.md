@@ -59,28 +59,47 @@ Automation should select the location explicitly:
 ```sh
 tes3cmd dump --morrowind-dir "/games/Morrowind" Morrowind.esm
 tes3cmd dump --data-files "/games/Morrowind/Data Files" MyMod.esp
+tes3cmd dump --openmw-config "$HOME/.config/openmw/openmw.cfg" MyMod.esp
 ```
 
 `--morrowind-dir` requires both `Data Files` and `Morrowind.ini` beneath the
 given directory. `--data-files` points directly to a data directory; its
-parent is used when a command also needs `Morrowind.ini`. The two options are
-mutually exclusive.
+parent is used when a command also needs `Morrowind.ini`. `--openmw-config`
+reads an explicit OpenMW configuration. These three options are mutually
+exclusive.
+
+When no location is explicit, a classic Morrowind installation found by
+walking upward from the current directory takes precedence over the default
+OpenMW user configuration. OpenMW defaults are
+`$XDG_CONFIG_HOME/openmw/openmw.cfg` (or
+`$HOME/.config/openmw/openmw.cfg`) on Linux,
+`$HOME/Library/Preferences/openmw/openmw.cfg` on macOS, and
+`Documents/My Games/OpenMW/openmw.cfg` on Windows.
 
 Plain `dump` and `diff` operations using explicit plugin paths work outside a
 Morrowind installation without a discovery warning. Installation-dependent
-features such as `--active`, load-order lookup, and master lookup still need a
-classic Morrowind layout.
+features such as `--active`, load-order lookup, and master lookup need either a
+classic Morrowind layout or OpenMW configuration.
 
 Commands that load master data may create reusable caches beneath
-`Morrowind/tes3cmd/cache`. Help, version, and location discovery alone do not
-create that directory. Cache entries are tied to the cache schema, codec
-version, and SHA-256 fingerprint of their source plugin. `--no-cache` bypasses
-cache reads and writes without deleting existing cache files.
+`Morrowind/tes3cmd/cache`, or beneath `tes3cmd/cache` next to the selected
+OpenMW configuration. Help, version, and location discovery alone do not create
+that directory. Cache entries are tied to the cache schema, codec version, and
+SHA-256 fingerprint of their source plugin. `--no-cache` bypasses cache reads
+and writes without deleting existing cache files.
 
-OpenMW configuration is not discovered yet. For an OpenMW installation,
-`--data-files` can select one data directory for direct plugin operations, but
-tes3cmd does not read `openmw.cfg`, combine multiple OpenMW data directories,
-or manage the OpenMW active-plugin list.
+OpenMW `data=` directories are combined in configuration order, with later
+directories overriding earlier ones. `data-local=` is always the final
+override. Relative and quoted paths, the `?userconfig?`, `?userdata?`, and
+`?global?` path tokens, chained `config=` directories, and `replace=data` or
+`replace=content` are supported. The `?local?` token requires OpenMW's binary
+location and is rejected; use an equivalent absolute path instead.
+Active TES3 plugins follow `content=` order exactly instead of using file
+timestamps. Native OpenMW content types such as `.omwaddon` and `.omwgame` are
+ignored because tes3cmd only parses TES3 ESM/ESP files. The `active` command can
+list OpenMW content but will not modify `openmw.cfg`; `--on` and `--off` are
+rejected. See the [OpenMW path documentation](https://openmw.readthedocs.io/en/stable/reference/modding/paths.html)
+for the underlying configuration rules.
 
 ## Common workflows
 

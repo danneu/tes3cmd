@@ -43,6 +43,10 @@ my $MODIFY_USER_SUB;
 our $CURRENT_PLUGIN = '';
 our $MWDIR;			# Where Morrowind is installed
 our $DATADIR;			# where "Data Files" lives ($MWDIR/Data Files)
+our @DATADIRS;			# ordered data directories, lowest priority first
+our $OPENMW_CONFIG;		# active read-only OpenMW configuration
+our @OPENMW_CONTENT;		# active OpenMW content in configured load order
+our $CONFIG_KIND;		# classic, openmw, data-only, or fallback
 our $TES3CMD_DIR;		# tes3cmd directory ($MWDIR/tes3cmd)
 our $CACHE_DIR;			# cache directory ($MWDIR/tes3cmd/cache)
 
@@ -50,6 +54,7 @@ our $CACHE_DIR;			# cache directory ($MWDIR/tes3cmd/cache)
 our $opt_data_files;
 our $opt_help;
 our $opt_morrowind_dir;
+our $opt_openmw_config;
 our $opt_version;
 our @STDOPT = (
     "assert",
@@ -57,6 +62,7 @@ our @STDOPT = (
     'data-files=s'    => \$opt_data_files,
     'help|h'          => \$opt_help,
     'morrowind-dir=s' => \$opt_morrowind_dir,
+    'openmw-config=s' => \$opt_openmw_config,
     "verbose",
     'version|V'       => \$opt_version,
 ); # options for all commands
@@ -291,15 +297,149 @@ BEGIN {
 
 ### CLASS: TES3::Util
 
-# Find the Morrowind installation explicitly or by walking up from the current
-# directory. Discovery only sets paths; commands create their own artifacts.
+sub openmw_option_value {
+    my($value) = @_;
+    $value =~ s/^\s+|\s+$//g;
+    return($value) unless ($value =~ /^"/);
+
+    my $decoded = '';
+    for (my $i = 1; $i < length($value); $i++) {
+	my $char = substr($value, $i, 1);
+	last if ($char eq '"');
+	if ($char eq '&' and $i + 1 < length($value)) {
+	    $i++;
+	    $char = substr($value, $i, 1);
+	}
+	$decoded .= $char;
+    }
+    return($decoded);
+}
+
+sub openmw_platform_paths {
+    my $user_home = ($^O =~ /^MSWin/)
+	? ($ENV{USERPROFILE} || $ENV{HOME})
+	: ($ENV{HOME} || $ENV{USERPROFILE});
+    return({}) unless defined($user_home);
+
+    if ($^O eq 'darwin') {
+	return({
+	    userconfig => "$user_home/Library/Preferences/openmw",
+	    userdata => "$user_home/Library/Application Support/openmw",
+	    global => '/Library/Application Support',
+	});
+    } elsif ($^O =~ /^MSWin/) {
+	my $directory = "$user_home/Documents/My Games/OpenMW";
+	return({ userconfig => $directory, userdata => $directory });
+    } else {
+	my $config_home = $ENV{XDG_CONFIG_HOME} || "$user_home/.config";
+	my $data_home = $ENV{XDG_DATA_HOME} || "$user_home/.local/share";
+	return({
+	    userconfig => "$config_home/openmw",
+	    userdata => "$data_home/openmw",
+	    global => '/usr/share/games',
+	});
+    }
+}
+
+sub openmw_path {
+    my($value, $config_file) = @_;
+    $value = openmw_option_value($value);
+    my $paths = openmw_platform_paths();
+    my $config_dir = File::Basename::dirname($config_file);
+    my %tokens = (
+	userconfig => $paths->{userconfig},
+	userdata => $paths->{userdata},
+	global => $paths->{global},
+    );
+    if ($value =~ /^\?([^?]+)\?(.*)$/) {
+	my($token, $remainder) = (lc($1), $2);
+	abort(qq{Unsupported OpenMW path token "?$token?" in "$config_file"})
+	    unless defined($tokens{$token});
+	$value = File::Spec->catfile($tokens{$token}, $remainder);
+    }
+    return(File::Spec->rel2abs($value, $config_dir));
+}
+
+sub read_openmw_configuration {
+    my($root_config) = @_;
+    my @pending = (File::Spec->rel2abs($root_config));
+    my %seen;
+    my(@data_dirs, @content);
+    my $data_local;
+
+    while (@pending) {
+	my $config_file = shift(@pending);
+	$config_file = File::Spec->catfile($config_file, 'openmw.cfg')
+	    if (-d $config_file);
+	next if ($seen{$config_file}++);
+	abort(qq{OpenMW configuration "$config_file" does not exist})
+	    unless (-f $config_file);
+
+	open(my $config, '<', $config_file)
+	    or abort(qq{opening OpenMW configuration "$config_file" ($!)});
+	my(@source_data, @source_content, @source_configs);
+	my %replace;
+	while (my $line = <$config>) {
+	    $line =~ s/\r?\n$//;
+	    next if ($line =~ /^\s*(?:#|$)/);
+	    next unless ($line =~ /^\s*([^=]+?)\s*=\s*(.*?)\s*$/);
+	    my($name, $value) = (lc($1), $2);
+	    if ($name eq 'data') {
+		push(@source_data, openmw_path($value, $config_file));
+	    } elsif ($name eq 'data-local') {
+		$data_local = openmw_path($value, $config_file);
+	    } elsif ($name eq 'content') {
+		push(@source_content, openmw_option_value($value));
+	    } elsif ($name eq 'config') {
+		push(@source_configs, openmw_path($value, $config_file));
+	    } elsif ($name eq 'replace') {
+		$replace{lc(openmw_option_value($value))} = 1;
+	    }
+	}
+	close($config) or abort(qq{closing OpenMW configuration "$config_file" ($!)});
+
+	@data_dirs = () if ($replace{data});
+	@content = () if ($replace{content});
+	push(@data_dirs, @source_data);
+	push(@content, @source_content);
+	push(@pending, @source_configs);
+    }
+
+    push(@data_dirs, $data_local) if (defined $data_local);
+    @data_dirs = grep {
+	if (-d $_) {
+	    1;
+	} else {
+	    dbg(qq{Missing OpenMW data directory: "$_"}) if (DBG);
+	    0;
+	}
+    } @data_dirs;
+    abort(qq{OpenMW configuration "$root_config" contains no usable data directories})
+	unless (@data_dirs);
+    @content = grep(/\.es[mp]$/i, @content);
+    return(\@data_dirs, \@content, $data_local);
+}
+
+sub default_openmw_config {
+    my $paths = openmw_platform_paths();
+    return unless (defined $paths->{userconfig});
+    my $config = File::Spec->catfile($paths->{userconfig}, 'openmw.cfg');
+    return((-f $config) ? $config : undef);
+}
+
+# Find game data explicitly, by walking up from the current directory, or in
+# the platform's default OpenMW user configuration. Discovery only sets paths;
+# commands create their own artifacts.
 sub find_morrowind {
-    my($requested_mwdir, $requested_datadir, $quiet) = @_;
+    my($requested_mwdir, $requested_datadir, $requested_openmw, $quiet) = @_;
     return($DATADIR) if (defined($DATADIR));
-    abort("--morrowind-dir and --data-files cannot be used together")
-	if (defined($requested_mwdir) and defined($requested_datadir));
+    my @requested = grep { defined($_) }
+	($requested_mwdir, $requested_datadir, $requested_openmw);
+    abort("--morrowind-dir, --data-files, and --openmw-config cannot be used together")
+	if (@requested > 1);
 
     if (defined($requested_mwdir)) {
+	$CONFIG_KIND = 'classic';
 	$MWDIR = File::Spec->rel2abs($requested_mwdir);
 	abort(qq{Morrowind directory "$requested_mwdir" does not exist})
 	    unless (-d $MWDIR);
@@ -310,10 +450,15 @@ sub find_morrowind {
 	    unless ($datadir and $mwini and -d "$MWDIR/$datadir" and -f "$MWDIR/$mwini");
 	$DATADIR = "$MWDIR/$datadir";
     } elsif (defined($requested_datadir)) {
+	$CONFIG_KIND = 'data-only';
 	$DATADIR = File::Spec->rel2abs($requested_datadir);
 	abort(qq{Data Files directory "$requested_datadir" does not exist})
 	    unless (-d $DATADIR);
 	$MWDIR = File::Basename::dirname($DATADIR);
+	@DATADIRS = ($DATADIR);
+    } elsif (defined($requested_openmw)) {
+	$CONFIG_KIND = 'openmw';
+	$OPENMW_CONFIG = File::Spec->rel2abs($requested_openmw);
     } elsif (!$quiet) {
 	my $dir = Cwd::getcwd();
 	abort("Current working directory does not exist") unless (defined $dir);
@@ -324,6 +469,7 @@ sub find_morrowind {
 	    my $datadir = $files->{"data files"};
 	    my $mwini = $files->{"morrowind.ini"};
 	    if ($datadir and $mwini) {
+		$CONFIG_KIND = 'classic';
 		$MWDIR = $dir;
 		$DATADIR = "$MWDIR/$datadir";
 		last;
@@ -333,22 +479,39 @@ sub find_morrowind {
 	    $dir = $parent;
 	    dbg(qq{Checking for "Data Files" in: "$dir"}) if (DBG);
 	}
+	unless (defined $MWDIR) {
+	    $OPENMW_CONFIG = default_openmw_config();
+	    $CONFIG_KIND = 'openmw' if (defined $OPENMW_CONFIG);
+	}
     }
 
-    if (defined $MWDIR) {
+    if (defined($CONFIG_KIND) and $CONFIG_KIND eq 'openmw') {
+	my($data_dirs, $content) = read_openmw_configuration($OPENMW_CONFIG);
+	@DATADIRS = @{$data_dirs};
+	@OPENMW_CONTENT = @{$content};
+	$DATADIR = $DATADIRS[-1];
+	my $config_dir = File::Basename::dirname($OPENMW_CONFIG);
+	$TES3CMD_DIR = "$config_dir/tes3cmd";
+	$CACHE_DIR = "$TES3CMD_DIR/cache";
+	msg(qq{OPENMW_CONFIG = "$OPENMW_CONFIG"}) if (VERBOSE);
+	msg(qq{DATADIRS = "@DATADIRS"}) if (VERBOSE);
+    } elsif (defined $MWDIR) {
+	@DATADIRS = ($DATADIR) unless (@DATADIRS);
 	$TES3CMD_DIR = "$MWDIR/tes3cmd";
 	$CACHE_DIR = "$MWDIR/tes3cmd/cache";
 	msg(qq{DATADIR = "$DATADIR"}) if (VERBOSE);
     } else {
-	msg(qq{WARNING: Can't find "Data Files" directory, functionality reduced. Use --morrowind-dir or --data-files, or first cd to somewhere under the Morrowind installation.}) unless ($quiet);
+	msg(qq{WARNING: Can't find game data, functionality reduced. Use --morrowind-dir, --data-files, or --openmw-config, or run under a Morrowind installation.}) unless ($quiet);
 	$MWDIR = '.';
 	$DATADIR = '.';		# not running under morrowind directory
+	@DATADIRS = ('.');
+	$CONFIG_KIND = 'fallback';
 	$TES3CMD_DIR = '.';
 	$CACHE_DIR = '.';
 	$opt_no_cache = 1;	# don't know where MW stuff is, turn off caching
     }
     prn qq{<DATADIR> is "$DATADIR"} if (VERBOSE);
-    if (!$quiet and -d "$DATADIR/tes3cmd") {
+    if (!$quiet and $CONFIG_KIND ne 'openmw' and -d "$DATADIR/tes3cmd") {
 	msg(qq{[Found old version of tes3cmd directory: $DATADIR/tes3cmd]});
 	msg(qq{[This old version can be safely removed. New version is now one level up.]});
     }
@@ -376,26 +539,31 @@ sub datafiles_map {
     my($self, $reload) = @_;
     return($self->{datafiles_map})
 	if (defined($self->{datafiles_map}) and (not $reload));
-    return($self->{datafiles_map} = list_files($DATADIR));
+    my %datafiles;
+    foreach my $directory (@DATADIRS) {
+	my $files = list_files($directory);
+	foreach my $name (keys %{$files}) {
+	    $datafiles{$name} = File::Spec->catfile($directory, $files->{$name});
+	}
+    }
+    return($self->{datafiles_map} = \%datafiles);
 }
 
 sub datapath {
     my($self, $plugin, $reload) = @_;
     assert(defined $DATADIR, "DATADIR is not defined") if (ASSERT);
-    my $path = $self->datafiles_map($reload)->{lc($plugin)};
-    if (defined $path) {
-	return("$DATADIR/" . $path);
-    } else {
-	return(undef);
-    }
+    return($self->datafiles_map($reload)->{lc($plugin)});
 }
 sub datafile {
     my($self, $plugin, $reload) = @_;
-    $self->datafiles_map($reload)->{lc($plugin)};
+    my $path = $self->datafiles_map($reload)->{lc($plugin)};
+    return(defined($path) ? File::Basename::basename($path) : undef);
 }
 
 sub ini_file {
     my($self, $reload) = @_;
+    abort("OpenMW configuration is read-only; Morrowind.ini is unavailable")
+	if (defined($CONFIG_KIND) and $CONFIG_KIND eq 'openmw');
     return($self->{ini_file})
 	if (defined($self->{ini_file} and not $reload));
     my $mwfiles = list_files($MWDIR);
@@ -407,6 +575,8 @@ sub ini_file {
 
 sub read_gamefiles {
     my($self) = @_;
+    return([@OPENMW_CONTENT])
+	if (defined($CONFIG_KIND) and $CONFIG_KIND eq 'openmw');
     my $mwini = $self->ini_file;
     my @gamefiles = ();
     open(my $ini, '<', $mwini) or abort(qq{opening "$mwini" for input ($!)});
@@ -436,6 +606,8 @@ sub read_gamefiles {
 
 sub write_gamefiles {
     my($self, $gamefiles) = @_;
+    abort("OpenMW configuration is read-only; active content cannot be changed")
+	if (defined($CONFIG_KIND) and $CONFIG_KIND eq 'openmw');
     my $mwini = $self->ini_file;
     open(my $inp, '<', $mwini) or abort(qq{opening "$mwini" for input ($!)});
     binmode($inp, ':raw') or abort(qq{setting binmode on "$mwini" ($!)});
@@ -567,6 +739,8 @@ sub load_order {
 	    dbg(qq{MISSING Gamefile: "$plugin"}) if (DBG);
 	}
     }
+    return(@{$self->{load_order} = \@active})
+	if (defined($CONFIG_KIND) and $CONFIG_KIND eq 'openmw');
     my @sorted = sort_by_date($DATADIR, @active);
     return(@{$self->{load_order} = [grep(/\.esm$/i, @sorted), grep(/\.esp$/i, @sorted)]});
 }
@@ -4882,6 +5056,9 @@ GLOBAL OPTIONS:
   --morrowind-dir <dir>
     use the Morrowind installation in <dir>
 
+  --openmw-config <file>
+    read data directories and active content from <file>
+
   --version, -V
     show the tes3cmd version
 
@@ -4931,6 +5108,10 @@ DESCRIPTION:
 
 Activates/Deactivates the specified plugins. When no options are specified,
 just prints current active load order.
+
+OpenMW content can be listed when --openmw-config is used or a default
+openmw.cfg is discovered. OpenMW configuration is read-only, so --on and
+--off are rejected in that mode.
 
 },
      },
@@ -9725,6 +9906,8 @@ sub cmd_active {
     my %active;
     my $n = 0;
     if ($opt_active_on or $opt_active_off) {
+	abort("OpenMW configuration is read-only; active content cannot be changed")
+	    if (defined($CONFIG_KIND) and $CONFIG_KIND eq 'openmw');
 	my $gamefiles = $T3->read_gamefiles();
 	my %gfiles = ();
 	my $modified = 0;
@@ -9862,6 +10045,7 @@ sub tes3cmd_main {
     TES3::Util::find_morrowind(
 	$opt_morrowind_dir,
 	$opt_data_files,
+	$opt_openmw_config,
 	(($cmd_name eq 'dump' and not $opt_active) or $cmd_name eq 'diff'),
     );
     msg("ASSERTIONS ON!") if (ASSERT);
