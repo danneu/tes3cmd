@@ -24,5 +24,7 @@ unlike(
 );
 ok(-f $round_trip, 'codec check writes a round-trip plugin');
 is(read_binary($round_trip), read_binary($plugin), 'codec round trip preserves every byte');
+is([glob(File::Spec->catfile($workdir, '*.tmp.*'))], [], 'codec check cleans its temporary file');
+ok(!-f File::Spec->catfile($workdir, 'minimal~1.esp'), 'named output does not back up the input');
 
 done_testing;

@@ -12,7 +12,9 @@ use IPC::Run3 qw(run3);
 our @EXPORT_OK = qw(
     read_binary
     run_command
+    run_command_with_env
     run_tes3cmd
+    run_tes3cmd_with_env
     tes3cmd_path
     write_minimal_plugin
 );
@@ -24,6 +26,11 @@ sub tes3cmd_path {
 
 sub run_command {
 	my ($cwd, @command) = @_;
+	return run_command_with_env($cwd, {}, @command);
+}
+
+sub run_command_with_env {
+	my ($cwd, $environment, @command) = @_;
 	my ($stdout, $stderr) = ('', '');
 	my $original_cwd = getcwd();
 	my $error;
@@ -31,6 +38,7 @@ sub run_command {
 
 	chdir($cwd) or die qq{Unable to enter test directory "$cwd": $!};
 	eval {
+		local @ENV{keys %{$environment}} = values %{$environment};
 		run3(\@command, \undef, \$stdout, \$stderr);
 		$raw_status = $?;
 		1;
@@ -52,6 +60,17 @@ sub run_command {
 sub run_tes3cmd {
 	my ($cwd, @arguments) = @_;
 	return run_command($cwd, $^X, tes3cmd_path(), @arguments);
+}
+
+sub run_tes3cmd_with_env {
+	my ($cwd, $environment, @arguments) = @_;
+	return run_command_with_env(
+		$cwd,
+		$environment,
+		$^X,
+		tes3cmd_path(),
+		@arguments,
+	);
 }
 
 sub _subrecord {

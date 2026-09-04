@@ -27,6 +27,7 @@ use File::Basename;
 use File::Spec;
 use File::Copy;
 use File::Find;
+use File::Temp qw(tempfile);
 use Getopt::Long qw(:config auto_abbrev);
 use Data::Dumper;
 use Storable;
@@ -3012,7 +3013,8 @@ sub write_rec {
 	abort("null hdrflags: self=".Dumper($self)) if not defined $self->hdrflags;
     }
     $self->encode() unless (defined $self->{_recbuf_}); # TBD - should re-encode if modified! (but then new() should set modified flag???)
-    print $fh pack("a4LLLa*", $self->rectype, $self->reclen, (my $reclen2 = 0), $self->hdrflags, $self->recbuf);
+    print $fh pack("a4LLLa*", $self->rectype, $self->reclen, (my $reclen2 = 0), $self->hdrflags, $self->recbuf)
+	or abort("writing record " . $self->rectype . " ($!)");
 }
 
 # tr->recbuf
@@ -6785,11 +6787,57 @@ sub make_temp {
     my($plugin) = @_;
     abort(qq{"$plugin" does not end in .esm/.esp/.ess})
 	if ($plugin !~ /\.(es[mps])$/i);
-    my $plugtmp = "$plugin.tmp";
     (-f $plugin) or abort(qq{Invalid input file ($!)});
     my $inp = open_for_input($plugin);
-    my $out = open_for_output($plugtmp);
-    return($inp, $out);
+    my($file, $dir) = fileparse($plugin);
+    my($out, $plugtmp) = tempfile("$file.tmp.XXXXXX", DIR => $dir, UNLINK => 0);
+    binmode($out, ':raw') or abort(qq{setting binmode on "$plugtmp" ($!)});
+    return($inp, $out, $plugtmp);
+}
+
+sub close_checked {
+    my($fh, $description) = @_;
+    return unless (defined($fh) and defined(fileno($fh)));
+    close($fh) or abort("closing $description ($!)");
+}
+
+sub validate_plugin {
+    my($plugin) = @_;
+    my $inp = open_for_input($plugin);
+    my $tr = TES3::Record->new_from_input($inp, undef, $plugin);
+    abort(qq{Validation failed for "$plugin": missing TES3 header})
+	unless (defined($tr) and $tr->rectype eq 'TES3');
+    while (TES3::Record->new_from_input($inp, undef, $plugin)) {}
+    close_checked($inp, qq{validation input "$plugin"});
+}
+
+sub install_replacement {
+    my($plugtmp, $plugin, $plugbak) = @_;
+    my $test_failure = $ENV{HARNESS_ACTIVE} && $ENV{TES3CMD_TEST_FAIL_REPLACE};
+
+    return if (!$test_failure and rename($plugtmp, $plugin));
+    my $first_error = "$!";
+
+    my($file, $dir) = fileparse($plugin);
+    my($holdfh, $hold) = tempfile("$file.tmp.rollback.XXXXXX", DIR => $dir, UNLINK => 0);
+    close_checked($holdfh, qq{rollback placeholder "$hold"});
+    unlink($hold) or abort(qq{removing rollback placeholder "$hold" ($!)});
+
+    rename($plugin, $hold)
+	or abort(qq{preparing to replace "$plugin" after rename failed ($first_error): $!});
+    if (!$test_failure and rename($plugtmp, $plugin)) {
+	unlink($hold) or abort(qq{removing rollback file "$hold" ($!)});
+	return;
+    }
+
+    my $install_error = $test_failure ? 'injected failure' : "$!";
+    unless (rename($hold, $plugin)) {
+	my $restore_error = "$!";
+	copy($plugbak, $plugin)
+	    or abort(qq{installing replacement failed ($install_error), and restoring "$plugin" failed ($restore_error); original retained at "$plugbak" ($!)});
+	unlink($hold) if -f $hold;
+    }
+    abort(qq{installing replacement "$plugtmp" as "$plugin" ($install_error)});
 }
 
 sub unique_backup_name {
@@ -6810,13 +6858,12 @@ sub unique_backup_name {
 }
 
 sub fix_output {
-    my($inp, $out, $plugin, $modified, $newname) = @_;
-    close($inp);
-    close($out);
-    my $plugtmp = "$plugin.tmp";
+    my($inp, $out, $plugtmp, $plugin, $modified, $newname) = @_;
+    close_checked($inp, qq{input "$plugin"});
+    close_checked($out, qq{temporary output "$plugtmp"});
     unless ($modified) {
 	print "$plugin was not modified\n";
-	unlink($plugtmp);
+	unlink($plugtmp) or abort(qq{removing temporary output "$plugtmp" ($!)});
 	return;
     }
     if ($opt_output_dir) {
@@ -6825,7 +6872,8 @@ sub fix_output {
 	$newname = "$opt_output_dir/" . (fileparse($newname))[0];
     }
     if (my($ext) = ($plugin =~ /\.(es[mps])$/i)) {
-	my($atime, $mtime) = (stat($plugin))[8,9];
+	my @plugin_stat = stat($plugin);
+	my($mode, $atime, $mtime) = ($plugin_stat[2] & 07777, @plugin_stat[8,9]);
 	if (File::Spec->rel2abs($newname) eq File::Spec->rel2abs($plugin)) {
 	    msg("fix_output(): newname ($newname) same as plugin ($plugin)");
 	    undef $newname;
@@ -6834,23 +6882,29 @@ sub fix_output {
 	    unless ($newname =~ /\.(es[mps])$/i) {
 		abort(qq{"$newname" name does not end in .esm/.esp/.ess});
 	    }
-	    unless (rename($plugtmp, $newname)) {
-		abort(qq{Renaming "$plugtmp" to "$newname" ($!)});;
-	    }
 	    $opt_header_update_record_count = 1;
-	    update_header($newname, [qw(QUIET NOBACKUP)]);
+	    update_header($plugtmp, [qw(QUIET NOBACKUP)]);
+	    validate_plugin($plugtmp);
+	    chmod($mode, $plugtmp)
+		or abort(qq{setting permissions on "$plugtmp" ($!)});
+	    rename($plugtmp, $newname)
+		or abort(qq{Renaming "$plugtmp" to "$newname" ($!)});
 	    utime($atime, $mtime, $newname);
 	    print qq{Output saved in: "$newname"\nOriginal unaltered: "$plugin"\n};
 	} else {
 	    my $plugbak = unique_backup_name($plugin);
-	    unless (rename($plugin, $plugbak)) {
-		abort(qq{Renaming "$plugin" to "$plugbak" ($!)});
-	    }
-	    unless (rename($plugtmp, $plugin)) {
-		abort(qq{Renaming "$plugtmp" to "$plugin" ($!)});
-	    }
 	    $opt_header_update_record_count = 1;
-	    update_header($plugin, [qw(QUIET NOBACKUP)]);
+	    update_header($plugtmp, [qw(QUIET NOBACKUP)]);
+	    validate_plugin($plugtmp);
+	    chmod($mode, $plugtmp)
+		or abort(qq{setting permissions on "$plugtmp" ($!)});
+	    copy($plugin, $plugbak)
+		or abort(qq{Backing up "$plugin" to "$plugbak" ($!)});
+	    chmod($mode, $plugbak)
+		or abort(qq{setting permissions on "$plugbak" ($!)});
+	    utime($atime, $mtime, $plugbak)
+		or abort(qq{setting timestamps on "$plugbak" ($!)});
+	    install_replacement($plugtmp, $plugin, $plugbak);
 	    utime($atime, $mtime, $plugin);
 	    my $destination = $plugbak;
 	    $destination =~ s!$DATADIR!<DATADIR>!;
@@ -6862,10 +6916,10 @@ sub fix_output {
 } # fix_output
 
 sub cleanup_temp {
-    my($inp, $plugin) = @_;
-    close($inp);
-    my $plugtmp = "$plugin.tmp";
-    unlink($plugtmp);
+    my($inp, $out, $plugtmp) = @_;
+    close($inp) if (defined($inp) and defined(fileno($inp)));
+    close($out) if (defined($out) and defined(fileno($out)));
+    unlink($plugtmp) if (defined($plugtmp) and -f $plugtmp);
 }
 
 # make a map of id -> recbuf for each plugin
@@ -7316,13 +7370,16 @@ sub update_header {
 	}
 	$tr->encode;
 	if ($tr->reclen() == $tes3len) {
-	    seek($fh, 0, SEEK_SET);
+	    seek($fh, 0, SEEK_SET)
+		or abort(qq{seeking to header in "$plugin" ($!)});
 	    $tr->write_rec($fh);
 	} else {
 	    abort("update_header(): output header size incorrect (expected:$tes3len, got: @{[$tr->reclen()]})");
 	}
+	close_checked($fh, qq{updated plugin "$plugin"});
+	$fh = undef;
     }
-    close($fh);
+    close_checked($fh, qq{plugin "$plugin"});
     utime($atime, $mtime, $plugin);
 }				# update_header
 
@@ -7476,11 +7533,11 @@ sub process_plugin_for_update {
     my($plugin, $fun, $prefix) = @_;
     my $expected = "TES3";
     my $modified;
-    my($inp, $out);
+    my($inp, $out, $plugtmp);
     # TBD - to support using instance types, will need to load masters
     # process each record in the plugin
     eval {
-	($inp, $out) = make_temp($plugin);
+	($inp, $out, $plugtmp) = make_temp($plugin);
 	while (my $tr = TES3::Record->new_from_input($inp, $expected, $plugin)) {
 	    $expected = undef;
 	    # function can delete, modify, or pass rec thru
@@ -7510,23 +7567,24 @@ sub process_plugin_for_update {
 		$modified++;
 	    }
 	}
+	if ($prefix) {
+	    my($file, $dir) = fileparse($plugin);
+	    my $newname = ($dir eq './') ? "${prefix}${file}" : "${dir}${prefix}${file}";
+	    fix_output($inp, $out, $plugtmp, $plugin, $modified, $newname);
+	} else {
+	    dbg("modified = $modified") if (DBG);
+	    fix_output($inp, $out, $plugtmp, $plugin, $modified);
+	}
     };
     if ($@) {
+	my $error = $@;
 	$modified = 0;	    # do not modify original plugin if errors occurred
-	if ($@ =~ /^Can't locate object method/) {
-	    warn qq{FATAL ERROR ($plugin): $@};
+	cleanup_temp($inp, $out, $plugtmp);
+	if ($error =~ /^Can't locate object method/) {
+	    die qq{FATAL ERROR ($plugin): $error};
 	} else {
-	    warn($@);
+	    die($error);
 	}
-	return(0);	    # TBD double check if need to cleanup tmp (output)
-    }
-    if ($prefix) {
-	my($file, $dir) = fileparse($plugin);
-	my $newname = ($dir eq './') ? "${prefix}${file}" : "${dir}${prefix}${file}";
-	fix_output($inp, $out, $plugin, $modified, $newname);
-    } else {
-	dbg("modified = $modified") if (DBG);
-	fix_output($inp, $out, $plugin, $modified);
     }
     return(1);
 } # process_plugin_for_update
@@ -9196,7 +9254,7 @@ sub cmd_dump {
 sub cmd_recover {
     my($plugin) = @_;
     dbg("cmd_recover($plugin)") if (DBG);
-    my($inp, $out) = make_temp($plugin);
+    my($inp, $out, $plugtmp) = make_temp($plugin);
     my $typlen = $RECTYPE_LEN - 1;
     my $buff;
     my $buff_size = 4096;
@@ -9271,10 +9329,10 @@ sub cmd_recover {
 	if (scalar(@removed) > 1) {
 	    print "Total bytes lost: $total\n";
 	}
-	fix_output($inp, $out, $plugin, 1);
+	fix_output($inp, $out, $plugtmp, $plugin, 1);
     } else {
 	print "Unable to recover data from $plugin\n";
-	cleanup_temp($inp, $plugin);
+	cleanup_temp($inp, $out, $plugtmp);
     }
 } # cmd_recover
 
