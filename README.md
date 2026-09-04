@@ -25,6 +25,15 @@ chmod +x tes3cmd
 perl tes3cmd --version
 ```
 
+The repository's Nix flake can build, run, or install tes3cmd with its Perl
+runtime on supported macOS and Linux systems:
+
+```sh
+nix run . -- --version
+nix build
+nix profile install .
+```
+
 The runtime uses modules distributed with Perl, including `Getopt::Long`,
 `Storable`, `File::Temp`, and `IO::Handle`. The project does not yet declare a
 minimum supported Perl version or a formal operating-system support matrix.
