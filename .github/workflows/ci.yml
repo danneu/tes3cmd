@@ -36,7 +36,7 @@ jobs:
       - name: git-cliff smoke test
         run: |
           out=$(nix run nixpkgs#git-cliff -- \
-            v0.40-pre-release-2..HEAD --strip all)
+            f72e9ed..HEAD --strip all)
           echo "$out"
 
           echo "$out" | grep -qF '### Features' \

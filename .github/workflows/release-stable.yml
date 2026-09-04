@@ -43,10 +43,17 @@ jobs:
           fi
 
           notes_file="$RUNNER_TEMP/release-notes.md"
-          nix run nixpkgs#git-cliff -- \
-            --current \
-            --strip all \
-            --output "$notes_file"
+          if [ "$tag" = "v0.40.0" ]; then
+            nix run nixpkgs#git-cliff -- \
+              "f72e9ed..$tag" \
+              --strip all \
+              --output "$notes_file"
+          else
+            nix run nixpkgs#git-cliff -- \
+              --current \
+              --strip all \
+              --output "$notes_file"
+          fi
           if [ ! -s "$notes_file" ]; then
             printf '_No notable changes._\n' > "$notes_file"
           fi
