@@ -37,6 +37,7 @@ use strict;
 use warnings;
 
 my $R;				# current record for modify command
+my $MODIFY_REPLACE_SUB;
 my $MODIFY_USER_SOURCE;
 my $MODIFY_USER_SUB;
 
@@ -6285,7 +6286,16 @@ more detail about the flagged items.
 	      if ($replace_modes > 1);
 	  abort("--replace/--replacefirst cannot be combined with trusted Perl options")
 	      if ($replace_modes and ($opt_modify_program_file or $opt_modify_run));
-	  return if ($replace_modes);
+	  if ($replace_modes) {
+	      my $replacer = $opt_modify_replace || $opt_modify_replacefirst;
+	      $replacer .= 'i';
+	      $replacer .= 'g' if ($opt_modify_replace);
+	      $MODIFY_REPLACE_SUB = eval qq{sub { \$_[0] =~ s$replacer }};
+	      my $error = $@;
+	      abort("Invalid replacer expression: $replacer ($error)")
+		  if ($error or ref($MODIFY_REPLACE_SUB) ne 'CODE');
+	      return;
+	  }
 
 	  if ($opt_modify_program_file) {
 	      load_perl($opt_modify_program_file, 'modify program');
@@ -9367,19 +9377,6 @@ sub cmd_modify {
     my($plugin) = @_;
     dbg("cmd_modify($plugin)") if (DBG);
     my $modify_subrecords = ($opt_sub_match or $opt_sub_no_match);
-    if (my $replacer = ($opt_modify_replace || $opt_modify_replacefirst)) {
-	# make the replacer case-insensitive
-	$replacer = qq{(?i)$replacer};
-	if (not $opt_modify_replacefirst) {
-	    # make the replacer global
-	    $replacer .= 'g';
-	}
-	# check that the replacer expression is valid
-	eval qq{(my \$foo = "HALCALI") =~ s$replacer;};
-	if ($@) {
-	    abort("Invalid replacer expression: $replacer");
-	}
-    }
     my $fun = sub {
 	my($rec_match, $rectype, $tr, $print_rec) = rec_match($plugin, @_); # calls tr->decode()
 	# we pass through all records that did not match the standard record selection switches of rec_match
@@ -9387,7 +9384,7 @@ sub cmd_modify {
 	my $id = $tr->id;
 	my $oldrec = $tr->recbuf;
 	my $modified = 0;
-	if ($opt_modify_replace) {
+	if ($MODIFY_REPLACE_SUB) {
 	    foreach my $tsr ($tr->subrecs()) {
 		if ($modify_subrecords) {
 		    my $subrec_str = $tsr->tostr;
@@ -9397,7 +9394,14 @@ sub cmd_modify {
 		eval { my @keys = keys %$tsr } ; abort("BAD TR: ".Dumper($tr)) if ($@);
 		foreach my $key (keys %$tsr) {
 		    next if ($key =~ /^_/); # skip keys that are not fieldnames
-		    $modified = 1 if (eval qq{\$tsr->{$key} =~ s$opt_modify_replace;});
+		    my $changed;
+		    my $ok = eval {
+			$changed = $MODIFY_REPLACE_SUB->($tsr->{$key});
+			1;
+		    };
+		    abort(qq{Replacement failed for "$plugin" record $rectype "$id": $@})
+			unless ($ok);
+		    $modified = 1 if ($changed);
 		}
 	    }
 	} elsif ($opt_modify_run) {
