@@ -6207,6 +6207,7 @@ tes3cmd modify --type cont --run "\$R->set({i=>[-3..-1],f=>'count'}, 4)" ale_clo
 		   'merge-objects'   => \$opt_multipatch_merge_objects,
 		   'no-activate'     => \$opt_multipatch_no_activate,
 		   'no-cache',
+		   'overwrite',
 		   'summons-persist' => \$opt_multipatch_summons_persist],
 
        preprocess => sub {
@@ -6256,6 +6257,9 @@ OPTIONS:
 
  --no-cache
 	do not create cache files (used for speedier operation)
+
+ --overwrite
+	replace an existing multipatch.esp after the new patch is validated
 
  --summons-persist
 	fixes summoned creatures crash by making them persistent
@@ -6545,7 +6549,8 @@ Example:
        options => [@STDOPT,
 		   'continue'             => \$opt_testcodec_continue,
 		   'exclude-type|x=s@'    => \@opt_testcodec_exclude_type,
-		   'ignore-cruft'         => \$opt_testcodec_ignore_cruft],
+		   'ignore-cruft'         => \$opt_testcodec_ignore_cruft,
+		   'overwrite'],
        process => \&cmd_testcodec,
        usage => qq{Usage: tes3cmd -testcodec [--exclude-type|-x exclude_type]\n},
      },
@@ -6883,6 +6888,13 @@ sub close_checked {
     close($fh) or abort("closing $description ($!)");
 }
 
+sub close_plugin_output {
+    my($fh, $description) = @_;
+    abort("writing $description (injected failure)")
+	if $ENV{HARNESS_ACTIVE} && $ENV{TES3CMD_TEST_FAIL_PLUGIN_WRITE};
+    close_checked($fh, $description);
+}
+
 sub validate_plugin {
     my($plugin) = @_;
     my $inp = open_for_input($plugin);
@@ -6915,11 +6927,47 @@ sub install_replacement {
     my $install_error = $test_failure ? 'injected failure' : "$!";
     unless (rename($hold, $plugin)) {
 	my $restore_error = "$!";
-	copy($plugbak, $plugin)
-	    or abort(qq{installing replacement failed ($install_error), and restoring "$plugin" failed ($restore_error); original retained at "$plugbak" ($!)});
+	if (defined($plugbak)) {
+	    copy($plugbak, $plugin)
+		or abort(qq{installing replacement failed ($install_error), and restoring "$plugin" failed ($restore_error); original retained at "$plugbak" ($!)});
+	} else {
+	    abort(qq{installing replacement failed ($install_error), and restoring "$plugin" failed ($restore_error); original retained at "$hold"});
+	}
 	unlink($hold) if -f $hold;
     }
     abort(qq{installing replacement "$plugtmp" as "$plugin" ($install_error)});
+}
+
+sub install_generated_output {
+    my($plugtmp, $destination, $overwrite) = @_;
+    my $exists = -e $destination;
+    abort(qq{Output destination "$destination" is not a regular file})
+	if ($exists and not -f $destination);
+    abort(qq{Output destination "$destination" already exists (use --overwrite to overwrite)})
+	if ($exists and not $overwrite);
+    my $test_failure = $ENV{HARNESS_ACTIVE} && $ENV{TES3CMD_TEST_FAIL_REPLACE};
+
+    unless ($exists) {
+	(!$test_failure and rename($plugtmp, $destination))
+	    or abort(qq{installing output "$destination" (@{[$test_failure ? 'injected failure' : $!]})});
+	return;
+    }
+
+    my($file, $dir) = fileparse($destination);
+    my($holdfh, $hold) = tempfile("$file.tmp.rollback.XXXXXX", DIR => $dir, UNLINK => 0);
+    close_checked($holdfh, qq{rollback placeholder "$hold"});
+    unlink($hold) or abort(qq{removing rollback placeholder "$hold" ($!)});
+    rename($destination, $hold)
+	or abort(qq{preparing to replace "$destination" ($!)});
+    if (!$test_failure and rename($plugtmp, $destination)) {
+	unlink($hold) or abort(qq{removing rollback file "$hold" ($!)});
+	return;
+    }
+
+    my $install_error = $test_failure ? 'injected failure' : "$!";
+    rename($hold, $destination)
+	or abort(qq{installing output failed ($install_error), and restoring "$destination" failed ($!); original retained at "$hold"});
+    abort(qq{installing output "$destination" ($install_error)});
 }
 
 sub unique_backup_name {
@@ -6942,7 +6990,7 @@ sub unique_backup_name {
 sub fix_output {
     my($inp, $out, $plugtmp, $plugin, $modified, $newname) = @_;
     close_checked($inp, qq{input "$plugin"});
-    close_checked($out, qq{temporary output "$plugtmp"});
+    close_plugin_output($out, qq{temporary plugin output "$plugtmp"});
     unless ($modified) {
 	print "$plugin was not modified\n";
 	unlink($plugtmp) or abort(qq{removing temporary output "$plugtmp" ($!)});
@@ -6969,9 +7017,9 @@ sub fix_output {
 	    validate_plugin($plugtmp);
 	    chmod($mode, $plugtmp)
 		or abort(qq{setting permissions on "$plugtmp" ($!)});
-	    rename($plugtmp, $newname)
-		or abort(qq{Renaming "$plugtmp" to "$newname" ($!)});
-	    utime($atime, $mtime, $newname);
+	    utime($atime, $mtime, $plugtmp)
+		or abort(qq{setting timestamps on "$plugtmp" ($!)});
+	    install_generated_output($plugtmp, $newname, $opt_overwrite);
 	    print qq{Output saved in: "$newname"\nOriginal unaltered: "$plugin"\n};
 	} else {
 	    my $plugbak = unique_backup_name($plugin);
@@ -6980,6 +7028,8 @@ sub fix_output {
 	    validate_plugin($plugtmp);
 	    chmod($mode, $plugtmp)
 		or abort(qq{setting permissions on "$plugtmp" ($!)});
+	    utime($atime, $mtime, $plugtmp)
+		or abort(qq{setting timestamps on "$plugtmp" ($!)});
 	    copy($plugin, $plugbak)
 		or abort(qq{Backing up "$plugin" to "$plugbak" ($!)});
 	    chmod($mode, $plugbak)
@@ -6987,7 +7037,6 @@ sub fix_output {
 	    utime($atime, $mtime, $plugbak)
 		or abort(qq{setting timestamps on "$plugbak" ($!)});
 	    install_replacement($plugtmp, $plugin, $plugbak);
-	    utime($atime, $mtime, $plugin);
 	    my $destination = $plugbak;
 	    $destination =~ s!$DATADIR!<DATADIR>!;
 	    print qq{Output saved in: "$plugin"\nOriginal backed up to: "$destination"\n};
@@ -7235,6 +7284,10 @@ sub load_mergeable_objects {
     }
     # save cache
     unless ($opt_no_cache) {
+	unless (-d $CACHE_DIR) {
+	    mkpath($CACHE_DIR, 0755)
+		or abort(qq{Unable to make directory: "$CACHE_DIR" ($!)});
+	}
 	store($cachedata, $mergeable_object_cache_file);
     }
     return($cachedata);
@@ -7318,6 +7371,10 @@ sub load_leveled_lists {
     }
     # save cache
     unless ($opt_no_cache) {
+	unless (-d $CACHE_DIR) {
+	    mkpath($CACHE_DIR, 0755)
+		or abort(qq{Unable to make directory: "$CACHE_DIR" ($!)});
+	}
 	store($cachedata, $leveled_list_cache_file);
     }
     return($cachedata);
@@ -7373,6 +7430,7 @@ sub make_header {
 
 sub update_header {
     my($plugin, $options) = @_;
+    $options ||= [];
     if (($opt_header_update_record_count or $opt_header_update_masters) and
 	($plugin =~ /~\d+\.es[mp]$/i)) {
 	prn("tes3cmd header skipping Backup: $plugin");
@@ -7381,13 +7439,12 @@ sub update_header {
     my $quiet = grep(/\bQUIET\b/, @$options);
     my $nobackup = grep(/\bNOBACKUP\b/, @$options);
     my $master;
-    my($atime, $mtime) = (stat($plugin))[8,9];
-    my $fh = open_for_update($plugin);
+    my @plugin_stat = stat($plugin);
+    abort(qq{reading metadata for "$plugin" ($!)}) unless @plugin_stat;
+    my($mode, $atime, $mtime) = ($plugin_stat[2] & 07777, @plugin_stat[8,9]);
+    my $fh = open_for_input($plugin);
     my $tr = TES3::Record->new_from_input($fh, 'TES3', $plugin);
-    unless (defined $tr) {
-	err("Error reading TES3 header from $plugin");
-	return;
-    }
+    abort(qq{Invalid plugin "$plugin": missing TES3 header}) unless defined $tr;
     my $tes3len = $tr->decode()->reclen();
     my $update_msg = '';
     my $modified = 0;
@@ -7397,25 +7454,31 @@ sub update_header {
 	if ($subtype eq 'HEDR') {
 	    $hedr_tsr = $tsr;
 	    if ($opt_header_author) {
-		$modified++;
-		$tsr->{author} =~ s!\000+$!!;
-		dbg("HEDR modified: author") if (DBG);
+		my $old_author = $tsr->{author};
+		$old_author =~ s!\000+$!!;
+		my $author;
 		if ($opt_header_author =~ /^\+(.*)/) {
-		    $tsr->{author} .= $1;
+		    $author = $old_author . $1;
 		} else {
-		    $tsr->{author} = $opt_header_author;
+		    $author = $opt_header_author;
+		}
+		if ($author ne $old_author) {
+		    $modified++;
+		    $tsr->{author} = $author;
+		    dbg("HEDR modified: author") if (DBG);
 		}
 	    }
 	    if ($opt_header_description) {
-		$modified++;
-		$tsr->{description} =~ s!\000+$!!;
-		dbg("HEDR modified: description: $opt_header_description") if (DBG);
-		$opt_header_description =~ s/\\n/\n/g;
-		$opt_header_description =~ s/\\r/\r/g;
-		if ($opt_header_description =~ /^\+(.*)/) {
-		    $tsr->{description} .= $1;
-		} else {
-		    $tsr->{description} = $opt_header_description;
+		my $old_description = $tsr->{description};
+		$old_description =~ s!\000+$!!;
+		my $description = $opt_header_description;
+		$description =~ s/\\n/\n/g;
+		$description =~ s/\\r/\r/g;
+		$description = $old_description . $1 if ($description =~ /^\+(.*)/s);
+		if ($description ne $old_description) {
+		    $modified++;
+		    $tsr->{description} = $description;
+		    dbg("HEDR modified: description: $opt_header_description") if (DBG);
 		}
 	    }
 	    if ($opt_header_update_record_count) {
@@ -7473,24 +7536,57 @@ sub update_header {
 	}
     }
     if ($modified) {
-	unless ($nobackup) {
-	    # make backup of plugin before making changes only if updating
-	    my $backup = unique_backup_name($plugin);
-	    copy($plugin, $backup) or abort("Error, copy failed $plugin -> $backup ($!)");
+	my($out, $plugtmp);
+	my $ok = eval {
+	    my($file, $dir) = fileparse($plugin);
+	    ($out, $plugtmp) = tempfile("$file.tmp.XXXXXX", DIR => $dir, UNLINK => 0);
+	    binmode($out, ':raw') or abort(qq{setting binmode on "$plugtmp" ($!)});
+	    $tr->encode;
+	    abort("update_header(): output header size incorrect (expected:$tes3len, got: @{[$tr->reclen()]})")
+		unless ($tr->reclen() == $tes3len);
+	    $tr->write_rec($out);
+	    my $buffer;
+	    while (1) {
+		my $n_read = read($fh, $buffer, 65536);
+		abort(qq{reading "$plugin" while updating its header ($!)}) unless defined $n_read;
+		last unless $n_read;
+		print {$out} $buffer
+		    or abort(qq{writing temporary plugin output "$plugtmp" ($!)});
+	    }
+	    close_checked($fh, qq{input "$plugin"});
+	    undef $fh;
+	    close_plugin_output($out, qq{temporary plugin output "$plugtmp"});
+	    undef $out;
+	    validate_plugin($plugtmp);
+	    chmod($mode, $plugtmp)
+		or abort(qq{setting permissions on "$plugtmp" ($!)});
+	    utime($atime, $mtime, $plugtmp)
+		or abort(qq{setting timestamps on "$plugtmp" ($!)});
+	    my $backup;
+	    unless ($nobackup) {
+		$backup = unique_backup_name($plugin);
+		copy($plugin, $backup)
+		    or abort(qq{backing up "$plugin" to "$backup" ($!)});
+		chmod($mode, $backup)
+		    or abort(qq{setting permissions on "$backup" ($!)});
+		utime($atime, $mtime, $backup)
+		    or abort(qq{setting timestamps on "$backup" ($!)});
+	    }
+	    install_replacement($plugtmp, $plugin, $backup);
+	    undef $plugtmp;
+	    1;
+	};
+	unless ($ok) {
+	    my $error = $@;
+	    cleanup_temp($fh, $out, $plugtmp);
+	    die($error);
 	}
-	$tr->encode;
-	if ($tr->reclen() == $tes3len) {
-	    seek($fh, 0, SEEK_SET)
-		or abort(qq{seeking to header in "$plugin" ($!)});
-	    $tr->write_rec($fh);
-	} else {
-	    abort("update_header(): output header size incorrect (expected:$tes3len, got: @{[$tr->reclen()]})");
-	}
-	close_checked($fh, qq{updated plugin "$plugin"});
-	$fh = undef;
     }
     close_checked($fh, qq{plugin "$plugin"});
-    utime($atime, $mtime, $plugin);
+    unless ($modified) {
+	utime($atime, $mtime, $plugin)
+	    or abort(qq{setting timestamps on "$plugin" ($!)});
+    }
 }				# update_header
 
 sub get_wanted {
@@ -7976,7 +8072,8 @@ sub cmd_fixit {
     $opt_hide_backups = $opt_overwrite = $opt_clean_instances = $opt_clean_cell_params =
 	$opt_clean_dups = $opt_clean_gmsts = $opt_clean_junk_cells = 1;
     foreach my $plugin ($T3->load_order()) {
-	cmd_clean($CURRENT_PLUGIN = $plugin)
+	my $path = $T3->datapath($plugin) || $plugin;
+	cmd_clean($CURRENT_PLUGIN = $path)
     }
     # generate all patches
     $opt_multipatch_cellnames = $opt_multipatch_fogbug = $opt_multipatch_merge_lists =
@@ -7986,7 +8083,8 @@ sub cmd_fixit {
     prn("\n\nSynchronizing Plugin Headers...");
     $opt_header_update_masters = $opt_header_update_record_count = 1;
     foreach my $plugin ($T3->load_order()) {
-	cmd_header($CURRENT_PLUGIN = $plugin)
+	my $path = $T3->datapath($plugin) || $plugin;
+	cmd_header($CURRENT_PLUGIN = $path)
     }
 }
 
@@ -8486,8 +8584,9 @@ sub cmd_multipatch {
 		}
 	    }
 	};
-	print $@ if ($@);
-	close_input($inp);
+	my $error = $@;
+	close_checked($inp, qq{input "$plugin"});
+	die($error) if $error;
     }
     my $nfogbugs = scalar keys %fogcell;
     my $nrenrevs = scalar(grep {defined} map {$_->{OUTPUTFLAG}} values(%rencell));
@@ -8495,8 +8594,15 @@ sub cmd_multipatch {
     if ($nfogbugs or $nrenrevs or $nsumcrea or $merged_lists or $merged_objects) {
 	print "\n".("="x75)."\n";
 	print "A multipatch has been conjured for you to address the following issues:\n";
-	my $out = open_for_output($patch_path);
-	print $out make_header();
+	abort(qq{Output destination "$patch_path" already exists (use --overwrite to overwrite)})
+	    if (-e $patch_path and not $opt_overwrite);
+	my($out, $plugtmp);
+	my $ok = eval {
+	    my($file, $dir) = fileparse($patch_path);
+	    ($out, $plugtmp) = tempfile("$file.tmp.XXXXXX", DIR => $dir, UNLINK => 0);
+	    binmode($out, ':raw') or abort(qq{setting binmode on "$plugtmp" ($!)});
+	print {$out} make_header()
+	    or abort(qq{writing temporary plugin output "$plugtmp" ($!)});
 	if ($nrenrevs) {
 	    print "\nPreserving the following $nrenrevs CELL renamings:\n";
 	    foreach my $coord (keys %rencell) {
@@ -8550,17 +8656,29 @@ sub cmd_multipatch {
 	    }
 	    print "\nMerged Leveled Lists ($count{LEVC} LEVC, $count{LEVI} LEVI)\n";
 	}
-	close($out);
+	close_plugin_output($out, qq{temporary plugin output "$plugtmp"});
+	undef $out;
 	my @options;
 	push(@options, 'cellnames') if $opt_multipatch_cellnames;
 	push(@options, 'fogbug') if $opt_multipatch_fogbug;
 	push(@options, 'merge_lists') if $opt_multipatch_merge_lists;
 	push(@options, 'summons_persist') if $opt_multipatch_summons_persist;
-	$opt_header_update_record_count = 1;
-	$opt_header_author = "tes3cmd multipatch";
-	$opt_header_description = "options: ".join(",", @options);
-	update_header($patch_path, [qw(QUIET NOBACKUP)]);
-	undef $opt_header_description;
+	{
+	    local $opt_header_update_record_count = 1;
+	    local $opt_header_author = "tes3cmd multipatch";
+	    local $opt_header_description = "options: ".join(",", @options);
+	    update_header($plugtmp, [qw(QUIET NOBACKUP)]);
+	}
+	validate_plugin($plugtmp);
+	install_generated_output($plugtmp, $patch_path, $opt_overwrite);
+	undef $plugtmp;
+	1;
+	};
+	unless ($ok) {
+	    my $error = $@;
+	    cleanup_temp(undef, $out, $plugtmp);
+	    die($error);
+	}
 	unless ($opt_multipatch_no_activate) {
 	    print "\n";
 	    # we need to reload our datafiles_map, because patch_file was just created
@@ -8917,38 +9035,53 @@ sub esp_esm_convert {
 	($output = $input) =~ s/\.esm$/.esp/i;
     }
     abort(qq{Error, $output already exists! (Use --overwrite to overwrite)})
-	if (-f $output and not $opt_overwrite);
-    copy($input, $output) or abort("Error, copy failed $input -> $output ($!)");
-    eval {
-	open(OUT, "+<$output") or abort(qq{Error opening "$output" for read/write ($!)});
-	binmode(OUT) or abort("Error setting binmode on $output ($!)");
-	my $magic;
-	(read(OUT, $magic, 4) == 4) or abort("$output: Error reading magic ($!)");
-	if ($magic eq "TES3") {
-	    seek(OUT, 28, SEEK_SET) or abort("seek");
-	    my $byte;
-	    (read(OUT, $byte, 1) == 1) or abort("$output: Error reading master byte ($!)");
-	    my $val = unpack("C", $byte);
-	    #msg("masterbyte = $val");
-	    ($byte eq $byte_expected) or
-		abort(qq{Error, expected master byte value of @{[unpack("C",$byte_expected)]}, got $val instead});
-	    seek(OUT, 28, SEEK_SET) or abort("seek");
-	    print OUT $byte_new or abort("$output: Error writing byte ($!)");
-	} elsif ($magic eq "TES4") {
-	    abort("This function is not yet implemented for TES4 files");
-	} else {
-	    abort("$output: Error, this does not appear to be Morrowind plugin");
+	if (-e $output and not $opt_overwrite);
+    validate_plugin($input);
+    my @input_stat = stat($input);
+    abort(qq{reading metadata for "$input" ($!)}) unless @input_stat;
+    my($mode, $atime, $mtime) = ($input_stat[2] & 07777, @input_stat[8,9]);
+    my($inp, $out, $plugtmp);
+    my $ok = eval {
+	$inp = open_for_input($input);
+	my($file, $dir) = fileparse($output);
+	($out, $plugtmp) = tempfile("$file.tmp.XXXXXX", DIR => $dir, UNLINK => 0);
+	binmode($out, ':raw') or abort(qq{setting binmode on "$plugtmp" ($!)});
+	my $prefix;
+	(read($inp, $prefix, 29) == 29)
+	    or abort(qq{Error reading TES3 header from "$input" ($!)});
+	my $magic = substr($prefix, 0, 4);
+	abort("This function is not yet implemented for TES4 files") if ($magic eq 'TES4');
+	abort(qq{"$input" does not appear to be a Morrowind plugin}) unless ($magic eq 'TES3');
+	my $byte = substr($prefix, 28, 1);
+	my $val = unpack("C", $byte);
+	($byte eq $byte_expected) or
+	    abort(qq{Error, expected master byte value of @{[unpack("C",$byte_expected)]}, got $val instead});
+	substr($prefix, 28, 1, $byte_new);
+	print {$out} $prefix or abort(qq{writing temporary plugin output "$plugtmp" ($!)});
+	my $buffer;
+	while (1) {
+	    my $n_read = read($inp, $buffer, 65536);
+	    abort(qq{reading "$input" ($!)}) unless defined $n_read;
+	    last unless $n_read;
+	    print {$out} $buffer or abort(qq{writing temporary plugin output "$plugtmp" ($!)});
 	}
-	close(OUT);
+	close_checked($inp, qq{input "$input"});
+	undef $inp;
+	close_plugin_output($out, qq{temporary plugin output "$plugtmp"});
+	undef $out;
+	validate_plugin($plugtmp);
+	chmod($mode, $plugtmp) or abort(qq{setting permissions on "$plugtmp" ($!)});
+	utime($atime, $mtime, $plugtmp)
+	    or abort(qq{setting timestamps on "$plugtmp" ($!)});
+	install_generated_output($plugtmp, $output, $opt_overwrite);
+	undef $plugtmp;
+	1;
     };
-    if ($@) {
+    unless ($ok) {
 	my $error = $@;
-	close(OUT);
-	unlink($output);
+	cleanup_temp($inp, $out, $plugtmp);
 	die($error);
     }
-    my($atime, $mtime) = (stat($input))[8,9];
-    utime($atime, $mtime, $output);
     prn(qq{"$input" copied to "$output"});
 } # esp_esm_convert
 
@@ -8981,7 +9114,7 @@ sub cmd_clean {
 	prn("tes3cmd clean skipping $plugin: because it's a backup.");
 	return;
     }
-    if (my $reason = $CLEAN_PLUGIN{lc($plugin)}) {
+    if (my $reason = $CLEAN_PLUGIN{lc(fileparse($plugin))}) {
 	prn("tes3cmd clean skipping $plugin: ${reason}.");
 	return;
     }
@@ -9328,7 +9461,9 @@ sub cmd_dump {
 sub cmd_recover {
     my($plugin) = @_;
     dbg("cmd_recover($plugin)") if (DBG);
-    my($inp, $out, $plugtmp) = make_temp($plugin);
+    my($inp, $out, $plugtmp);
+    my $ok = eval {
+    ($inp, $out, $plugtmp) = make_temp($plugin);
     my $typlen = $RECTYPE_LEN - 1;
     my $buff;
     my $buff_size = 4096;
@@ -9407,6 +9542,13 @@ sub cmd_recover {
     } else {
 	print "Unable to recover data from $plugin\n";
 	cleanup_temp($inp, $out, $plugtmp);
+    }
+    1;
+    };
+    unless ($ok) {
+	my $error = $@;
+	cleanup_temp($inp, $out, $plugtmp);
+	die($error);
     }
 } # cmd_recover
 
@@ -9522,11 +9664,13 @@ sub cmd_active {
 sub cmd_resetdates {
     foreach my $file_name (sort keys %ORIGINAL_DATE) {
 	my $file_path = $T3->datapath($file_name);
+	next unless (defined($file_path) and -f $file_path);
 	my($atime, $mtime) = (stat($file_path))[8,9];
 	my $origtime = $ORIGINAL_DATE{$file_name};
 	if ($mtime != $origtime) {
 	    prn("Reset Date of: $file_name to: ".scalar(localtime($origtime)));
-	    utime($origtime, $origtime, $file_path);
+	    utime($origtime, $origtime, $file_path)
+		or abort(qq{setting timestamps on "$file_path" ($!)});
 	}
     }
 }
