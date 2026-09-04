@@ -11,7 +11,7 @@
         "aarch64-linux"
         "x86_64-linux"
       ];
-      version = "0.40-PRE-RELEASE-2";
+      version = "0.40.0";
       testPerl =
         pkgs:
         pkgs.perl.withPackages (
