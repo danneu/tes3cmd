@@ -73,7 +73,9 @@ classic Morrowind layout.
 
 Commands that load master data may create reusable caches beneath
 `Morrowind/tes3cmd/cache`. Help, version, and location discovery alone do not
-create that directory.
+create that directory. Cache entries are tied to the cache schema, codec
+version, and SHA-256 fingerprint of their source plugin. `--no-cache` bypasses
+cache reads and writes without deleting existing cache files.
 
 OpenMW configuration is not discovered yet. For an OpenMW installation,
 `--data-files` can select one data directory for direct plugin operations, but

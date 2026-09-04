@@ -30,6 +30,7 @@ use File::Find;
 use File::Temp qw(tempfile);
 use Getopt::Long qw(:config auto_abbrev);
 use Data::Dumper;
+use Digest::SHA;
 use Storable;
 use Cwd;
 use strict;
@@ -3977,7 +3978,10 @@ TES3::Record::generate_classes();
 
 ### MAIN CONSTANTS
 
-use constant { MIN_TES3_PLUGIN_SIZE => 324 };
+use constant {
+    CACHE_SCHEMA_VERSION => 1,
+    MIN_TES3_PLUGIN_SIZE => 324,
+};
 
 ### MAIN GLOBALS (Miscellaneous)
 
@@ -4998,7 +5002,7 @@ OPTIONS:
 	clean junk cells (no new info from definition in masters)
 
  --no-cache
-	do not create cache files (used for speedier cleaning)
+	bypass cache reads and writes without deleting existing cache files
 
  --output-dir <dir>
 	set output directory to <dir> (default is where input plugin is)
@@ -6254,7 +6258,7 @@ OPTIONS:
 	do not automatically activate multipatch.esp
 
  --no-cache
-	do not create cache files (used for speedier operation)
+	bypass cache reads and writes without deleting existing cache files
 
  --overwrite
 	replace an existing multipatch.esp after the new patch is validated
@@ -7129,27 +7133,58 @@ sub master_cache_path {
     return($cname);
 }
 
+sub plugin_fingerprint {
+    my($plugin) = @_;
+    my $fh = open_for_input($plugin);
+    my $sha = Digest::SHA->new(256);
+    $sha->addfile($fh);
+    close_checked($fh, qq{fingerprint input "$plugin"});
+    return({
+	sha256 => $sha->hexdigest,
+	size => -s $plugin,
+    });
+}
+
+sub fingerprint_matches {
+    my($cached, $current) = @_;
+    return(0) unless (ref($cached) eq 'HASH');
+    return(0) unless (defined($cached->{size}) and defined($cached->{sha256}));
+    return(0) unless ($cached->{size} =~ /^\d+$/ and
+	$cached->{sha256} =~ /^[0-9a-f]{64}$/);
+    return($cached->{size} == $current->{size} and
+	$cached->{sha256} eq $current->{sha256});
+}
+
+sub new_aggregate_cache {
+    return({
+	_codec_version_ => $TES3::Record::CODEC_VERSION,
+	_schema_version_ => CACHE_SCHEMA_VERSION,
+    });
+}
+
 sub load_master_cache {
     my($esm) = @_;
     my $mcache = master_cache_path($esm);
-    if ($opt_no_cache) {
-	unlink($mcache) if (-f $mcache);
-	return(0);
-    }
+    return(0) if ($opt_no_cache);
     dbg("master cache name = $mcache") if (DBG);
     eval {
-	if (my $listref = retrieve($mcache)) {
-	    my($prev_size, $master_data) = @{$listref};
-	    my $curr_size = (-s $T3->datapath($esm));
-	    if ($curr_size == $prev_size) {
-		$MASTER_ID->{$esm} = $master_data;
-		print "Loaded cached Master: <DATADIR>/$esm\n";
-	    } else {
-		die("Cache Invalidated for: $esm (curr_size == $curr_size, prev_size == $prev_size)");
-	    }
-	} else {
-	    die("Error retrieving master cache for: $esm");
-	}
+	my $cache = retrieve($mcache);
+	die("Master cache schema mismatch for: $esm")
+	    unless (ref($cache) eq 'HASH' and
+		defined($cache->{schema_version}) and
+		$cache->{schema_version} =~ /^\d+$/ and
+		$cache->{schema_version} == CACHE_SCHEMA_VERSION);
+	die("Master cache codec mismatch for: $esm")
+	    unless (defined($cache->{codec_version}) and
+		$cache->{codec_version} eq $TES3::Record::CODEC_VERSION);
+	my $master_file = $T3->datapath($esm);
+	my $current = plugin_fingerprint($master_file);
+	die("Master cache source changed for: $esm")
+	    unless fingerprint_matches($cache->{source}, $current);
+	die("Master cache has no record data for: $esm")
+	    unless (ref($cache->{records}) eq 'HASH');
+	$MASTER_ID->{$esm} = $cache->{records};
+	print "Loaded cached Master: <DATADIR>/$esm\n";
     };
     if ($@) {
 	msg($@) unless ($@ =~ /: No such file or directory/);
@@ -7160,15 +7195,21 @@ sub load_master_cache {
 }
 
 sub save_master_cache {
-    my($esm) = @_;
+    my($esm, $source) = @_;
     return(0) if ($opt_no_cache);
     unless (-d $CACHE_DIR) {
 	Util::mkpath($CACHE_DIR, 0755) or
 	    abort(qq{Unable to make directory: "$CACHE_DIR" ($!)});
     }
-    my $size = (-s $T3->datapath($esm));
-    dbg("save_master_cache($esm) saving size: $size") if (DBG);
-    store([ $size, $MASTER_ID->{$esm}], master_cache_path($esm));
+    my $master_file = $T3->datapath($esm);
+    $source ||= plugin_fingerprint($master_file);
+    dbg("save_master_cache($esm) saving fingerprint: $source->{sha256}") if (DBG);
+    store({
+	codec_version => $TES3::Record::CODEC_VERSION,
+	records => $MASTER_ID->{$esm},
+	schema_version => CACHE_SCHEMA_VERSION,
+	source => $source,
+    }, master_cache_path($esm));
 }
 
 # load all the records from a master .esm into a dictionary.
@@ -7187,9 +7228,12 @@ sub load_master {
 	err("Master: $esm not found in <DATADIR>");
 	return;
     }
+    my $source = plugin_fingerprint($master_file);
     my $inp = open_for_input($master_file);
-    eval {
-	while (my($rectype, $id, $srh, $recbuf, $hdrflags) = read_quick_parse($inp, undef, $esm)) {
+    my $ok = eval {
+	my $expected = 'TES3';
+	while (my($rectype, $id, $srh, $recbuf, $hdrflags) = read_quick_parse($inp, $expected, $esm)) {
+	    $expected = undef;
 	    last if (not defined $rectype);
 	    next if ($hdrflags & $HDR_FLAGS{ignored});
 	    next if (defined $types and not $types->{$rectype});
@@ -7197,10 +7241,20 @@ sub load_master {
 	    abort("undefined recbuf") unless defined $recbuf;
 	    $MASTER_ID->{$esm}->{$id}->{$rectype} = [$recbuf, $hdrflags];
 	}
+	1;
     };
-    err($@) if ($@);
-    close_input($inp);
-    save_master_cache($esm);
+    my $error = $@;
+    close_checked($inp, qq{master input "$master_file"});
+    unless ($ok) {
+	delete $MASTER_ID->{$esm};
+	die($error);
+    }
+    my $completed_source = plugin_fingerprint($master_file);
+    unless (fingerprint_matches($source, $completed_source)) {
+	delete $MASTER_ID->{$esm};
+	abort(qq{Master "$master_file" changed while it was being read});
+    }
+    save_master_cache($esm, $completed_source);
 }
 
 sub load_mergeable_objects {
@@ -7286,27 +7340,28 @@ sub load_mergeable_objects {
 } # load_mergeable_objects
 
 sub load_leveled_lists {
-    my $cachedata = {};
+    my $cachedata = new_aggregate_cache();
     my $leveled_list_cache_file = "$CACHE_DIR/leveled_lists_data.cache";
     # load cache
-    if ($opt_no_cache) {
-	unlink($leveled_list_cache_file)
-	    if (-f $leveled_list_cache_file);
-    } else {
+    unless ($opt_no_cache) {
 	if (-f $leveled_list_cache_file) {
-	    eval { $cachedata = retrieve($leveled_list_cache_file); };
-	    if ($@) {
+	    my $loaded;
+	    eval { $loaded = retrieve($leveled_list_cache_file); };
+	    if ($@ or ref($loaded) ne 'HASH') {
 		msg("Invalid Leveled Lists Cache, will rebuild");
-		$cachedata = {};
+	    } elsif (not defined($loaded->{_schema_version_}) or
+		     $loaded->{_schema_version_} !~ /^\d+$/ or
+		     $loaded->{_schema_version_} != CACHE_SCHEMA_VERSION) {
+		msg("Invalidating Leveled List Cache due to schema update.");
+	    } elsif (not defined($loaded->{_codec_version_}) or
+		     $loaded->{_codec_version_} ne $TES3::Record::CODEC_VERSION) {
+		msg("Invalidating Leveled List Cache due to CODEC update.");
+	    } else {
+		$cachedata = $loaded;
 	    }
 	} else {
 	    msg("Creating Leveled Lists Cache");
 	}
-    }
-    # Invalidate entire cache when codec changes
-    if (defined($cachedata->{_codec_version_}) and $cachedata->{_codec_version_} ne $TES3::Record::CODEC_VERSION) {
-	msg("Invalidating Leveled List Cache due to CODEC update.");
-	$cachedata = {_codec_version_ => $TES3::Record::CODEC_VERSION };
     }
     my @load_order = $T3->load_order;
     my %active = map { lc($_), 1 } @load_order;
@@ -7324,24 +7379,27 @@ sub load_leveled_lists {
 		if ($opt_multipatch_merge_lists);
 	    next;
 	}
-	my $curr_size = -s $T3->datapath($plugin);
+	my $plugin_file = $T3->datapath($plugin);
+	my $source = plugin_fingerprint($plugin_file);
 	my $invalid = 0;
-	if (defined($cachedata->{$lc_plugin})) {
-	    # update plugins that have changed size
-	    unless ($curr_size == $cachedata->{$lc_plugin}->{_size_}) {
+	if (ref($cachedata->{$lc_plugin}) eq 'HASH') {
+	    unless (fingerprint_matches($cachedata->{$lc_plugin}->{_source_}, $source)) {
 		msg("Leveled List Cache UPDATING: $plugin");
 		delete $cachedata->{$lc_plugin};
 		$invalid = 1;
 	    }
 	} else {
+	    delete $cachedata->{$lc_plugin};
 	    # add plugins added to load order
 	    prn("Leveled List Cache ADDING: $plugin") if (VERBOSE);
 	    $invalid = 1;
 	}
 	if ($invalid) {
-	    my $inp = open_for_input($T3->datapath($plugin));
+	    my $inp = open_for_input($plugin_file);
 	    eval {
-		while (my $tr = TES3::Record->new_from_input($inp, undef, $plugin)) {
+		my $expected = 'TES3';
+		while (my $tr = TES3::Record->new_from_input($inp, $expected, $plugin)) {
+		    $expected = undef;
 		    next unless ($tr->rectype =~ /^LEV[CI]$/);
 		    next if ($tr->hdrflags & $HDR_FLAGS{ignored});
 		    $tr->decode;
@@ -7353,12 +7411,18 @@ sub load_leveled_lists {
 		err($@);
 		delete $cachedata->{$lc_plugin};
 	    } else {
-		$cachedata->{$lc_plugin}->{_size_} = $curr_size;
+		my $completed_source = plugin_fingerprint($plugin_file);
+		unless (fingerprint_matches($source, $completed_source)) {
+		    delete $cachedata->{$lc_plugin};
+		    abort(qq{Plugin "$plugin_file" changed while it was being cached});
+		}
+		$cachedata->{$lc_plugin}->{_source_} = $completed_source;
 	    }
 	}
     }
     # delete plugins no longer in load order
     foreach my $plugin (keys %$cachedata) {
+	next if ($plugin =~ /^_/);
 	delete $cachedata->{$plugin} unless ($active{$plugin});
     }
     # save cache
